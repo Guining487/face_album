@@ -338,10 +338,14 @@ def _face_quality_score(image, bbox, det_score=1.0):
     如果两种脸用同一把尺子去比，模糊脸很容易认错人或者没人要。
     所以我们要给每张脸估个清楚分，越模糊后面聚类时标准越放宽。
 
-    怎么算：
-      - 把脸那块从原图抠出来，用 Laplacian 算子看“边缘锐利度”，
-        照片越清楚，边缘越锐利，这个数值越大；
-      - 再结合人脸检测给的置信度（det_score，0~1），综合成一个分。
+    怎么算？三个线索加在一起（都压到 0~1）：
+      1) 锐利度：把脸抠出来用 Laplacian 算子看“边缘锐利度”，
+         照片越清楚边缘越锐利，这个数值越大；
+      2) 人脸像素占比：脸在整张照片里占多大（宽×高 / 原图宽×高）。
+         脸越大，能用的有效细节越多；脸小到快贴不上，信息天生不足；
+      3) 检测置信度：人脸检测给的 det_score，模型对这张脸越有把握越高。
+
+    权重：锐利度最要紧占 4 成，人脸大小其次占 3 成，置信度垫底占 3 成。
     """
     h, w = image.shape[:2]                 # 原图高、宽
     x1, y1, x2, y2 = [int(v) for v in bbox]  # 人脸框四角坐标
@@ -350,13 +354,20 @@ def _face_quality_score(image, bbox, det_score=1.0):
     crop = image[y1:y2, x1:x2]                # 把人脸那块抠出来
     if crop is None or crop.size == 0:
         return 0.0                            # 抠空了就当最模糊
+
+    # 1) 锐利度：Laplacian 方差，越大越清楚。没有上限，经验上 500 已算很清晰
     gray = cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY)   # 转成灰度图才好算边缘
-    # Laplacian 方差：越大说明边缘越锐利 = 越清楚
     laplacian_var = cv2.Laplacian(gray, cv2.CV_64F).var()
-    # 这个数值没有上限，经验上 500 左右已经算很清楚了，压到 0~1
     sharpness = min(1.0, laplacian_var / 500.0)
-    # 清楚分 = 锐利度为主（7成），检测置信度为辅（3成）
-    return max(0.0, min(1.0, 0.7 * sharpness + 0.3 * det_score))
+
+    # 2) 人脸像素占比：脸面积 / 整张图面积。一般占 1% 以上就是很清晰的大脸了
+    face_area = (x2 - x1) * (y2 - y1)              # 脸框有多少像素
+    img_area = max(1, h * w)                       # 整张图有多少像素
+    area_ratio = face_area / img_area
+    size_score = min(1.0, area_ratio / 0.01)       # 占比 1% 就算满分
+
+    # 3) 三合一：锐利度 4 成 + 人脸大小 3 成 + 检测置信度 3 成
+    return max(0.0, min(1.0, 0.4 * sharpness + 0.3 * size_score + 0.3 * det_score))
 
 
 def smart_cluster(emb, eps, min_cluster, max_iters=3, qualities=None):
