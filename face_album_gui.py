@@ -77,8 +77,10 @@ from insightface.app import FaceAnalysis   # 现成人脸识别模型封装：�
 # C++ 里你写 const std::string kModelRoot = ...; Python 没有 const，全靠自觉不改它。
 # 名字带前导下划线 _xxx 是一种约定俗成：告诉别人“这是模块内部用的，别在外面碰”。
 _CANDIDATE_ROOTS = [          # 这是一个 list（列表）
-    # 优先使用“本脚本所在目录”下的 .insightface（随仓库走，方便移植）
-    os.path.join(os.path.dirname(os.path.abspath(__file__)), '.insightface'),
+    # 优先使用“程序所在目录”下的 .insightface（随软件走，方便移植）。
+    # 打包成 exe 后 __file__ 指向临时解压目录，这里改用 exe 所在目录(sys.executable)。
+    os.path.join(os.path.dirname(sys.executable) if getattr(sys, 'frozen', False)
+                 else os.path.dirname(os.path.abspath(__file__)), '.insightface'),
     # 其次回退到当前用户主目录下的 .insightface（insightface 默认下载位置）
     os.path.join(os.path.expanduser('~'), '.insightface'),
     # os.path.expanduser('~') 会得到当前用户主目录，如 C:\Users\guigu
@@ -107,21 +109,30 @@ SUPPORTED = {'.jpg', '.jpeg', '.png', '.bmp', '.webp'}
 # 颜色用“十六进制”表示，格式是 #红红绿绿蓝蓝，每两位一个 0~255 的十六进制数：
 #   #ff0000 红  #00ff00 绿  #0000ff 蓝  #ffffff 白  #000000 黑
 # 可以用在线“取色器”自己挑喜欢的颜色，把值填进来即可。
-C_BG        = '#eef1f7'   # 窗口/画布背景：极浅的蓝灰，比刺眼的纯白柔和
-C_PANEL     = '#ffffff'   # 面板背景：纯白，用于顶栏、工具条、人物卡片
-C_ACCENT    = '#4f6ef2'   # 主色调（蓝紫）：按钮、标题、进度条、悬停高亮都用它
-C_ACCENT_LT = '#6c85f6'   # 主色调的“浅一档”：鼠标悬停在按钮上时用
-C_ACCENT_DK = '#3b58d0'   # 主色调的“深一档”：按钮按下那一刻用
-C_BORDER    = '#d8dfed'   # 卡片/输入框的“淡边框”颜色
-C_TEXT      = '#27303f'   # 主文字颜色：深蓝灰，比纯黑更耐看
-C_TEXT_SUB  = '#7b8496'   # 次要文字颜色：中灰，用于说明、提示
-C_CARD_HOV  = '#4f6ef2'   # 鼠标悬停在人物卡片上时，边框变成主色调（提示“可以点”）
+C_BG          = '#faf7f2'   # 窗口/画布背景：极浅米色，比刺眼的纯白柔和
+C_BG_DEEP     = '#f5f1ed'   # 画布背景的“深一档”：让白色卡片浮在更明显的底色上
+C_PANEL       = '#fffbf8'   # 面板背景：极浅奶油色，用于顶栏、工具条、人物卡片
+C_ACCENT      = '#d4956e'   # 主色调（温暖杏色）：按钮、标题、进度条、悬停高亮都用它
+C_ACCENT_LT   = '#e0a87c'   # 主色调的“浅一档”：鼠标悬停在按钮上时用
+C_ACCENT_DK   = '#c47e54'   # 主色调的“深一档”：按钮按下那一刻用
+C_ACCENT_SOFT = '#f5ede7'   # 主色调的“极浅打底”：按钮悬停背景、小徽章底色
+C_BORDER      = '#e8ddd5'   # 卡片/输入框的“淡边框”颜色
+C_BORDER_DK   = '#d9cfc6'   # 稍深一点的边框/分隔线颜色
+C_TEXT        = '#5c4a40'   # 主文字颜色：温暖深棕，比纯黑更耐看
+C_TEXT_TITLE  = '#4a3830'   # 标题/大号文字：比正文更深，更有分量
+C_TEXT_SUB    = '#9b8b7e'   # 次要文字颜色：暖灰棕，用于说明、提示
+C_TEXT_DIS    = '#bfb0a6'   # 置灰文字：浅棕灰，用于禁用/占位提示
+C_OK          = '#6ba383'   # 状态灯·绿：就绪/完成
+C_RUN         = '#d4956e'   # 状态灯·橙：正在处理
+C_ERR         = '#d97a66'   # 状态灯·红：出错
+C_WARN        = '#e8a76e'   # 状态灯·琥珀：警告
+C_CARD_HOV    = '#d4956e'   # 鼠标悬停在人物卡片上时，边框变成主色调（提示“可以点”）
 # ---------------------------------------------------------------------------
 # 字体：tuple (字体名, 字号, 可选样式)。ttk 控件按这个显示文字。
 FONT      = ('Microsoft YaHei', 10)            # 默认正文：微软雅黑 10 号
 FONT_BOLD = ('Microsoft YaHei', 10, 'bold')    # 加粗：卡片标题等
 FONT_SMALL = ('Microsoft YaHei', 8)            # 小号：文件名等次要文字
-FONT_TITLE = ('Microsoft YaHei', 18, 'bold')   # 顶栏大标题
+FONT_TITLE = ('Microsoft YaHei', 22, 'bold')   # 顶栏大标题
 FONT_SUB   = ('Microsoft YaHei', 9)            # 顶栏副标题
 
 # 网格每行放几张卡片（两个窗口共用）
@@ -440,7 +451,6 @@ class FaceAlbumGUI:
         self.min_cluster = tk.IntVar(value=2)           # 最少照片数，整数，默认 2
         self.use_gpu = tk.BooleanVar(value=True)        # “GPU加速”勾选框，默认勾上
         self.status_text = tk.StringVar(value="就绪 —— 请选择照片文件夹")  # 底部状态栏文字
-        self.export_enable = tk.BooleanVar(value=False) # “写入相册到硬盘”总开关，默认关
         self.export_mode = tk.StringVar(value='copy')   # 写入方式：'copy'=复制 / 'move'=移动原图
         self.app = None              # insightface 模型对象。None 表示“还没加载”
         #                               空值占位，第一次真正用之前再建(见 _cluster_worker 懒加载)
@@ -491,7 +501,7 @@ class FaceAlbumGUI:
         #   状态是 ttk 内置的：active=鼠标悬停、pressed=按住、disabled=置灰……
         #   这里让按钮悬停时浅一点、按下时深一点，做出“会动”的反馈。
         style.map('TButton',
-                  background=[('active', '#eef1fb'), ('pressed', '#dde3f6')],
+                  background=[('active', C_ACCENT_SOFT), ('pressed', '#ecd9c9')],
                   bordercolor=[('active', C_ACCENT), ('focus', C_ACCENT)])
 
         # --- 主按钮（“开始聚类”）：主色调填充，白字，看起来像“最该点的那颗” ---
@@ -505,7 +515,7 @@ class FaceAlbumGUI:
         style.map('Primary.TButton',
                   background=[('active', C_ACCENT_LT),   # 悬停变浅
                               ('pressed', C_ACCENT_DK)], # 按下变深
-                  foreground=[('disabled', '#c8cfe8')])  # 置灰时文字也变浅
+                  foreground=[('disabled', C_TEXT_DIS)])  # 置灰时文字也变浅
 
         # --- 输入框：白底、淡边框、聚焦时边框变主色（给人“我在编辑它”的提示） ---
         style.configure('TEntry',
@@ -529,16 +539,16 @@ class FaceAlbumGUI:
         # --- 进度条：满格部分用主色调，没走到的部分用浅灰，不再是一根死板的绿条 ---
         style.configure('Horizontal.TProgressbar',
                         background=C_ACCENT,          # 已填充颜色
-                        troughcolor='#e4e8f2',        # 轨道(底槽)颜色
-                        bordercolor='#e4e8f2',
+                        troughcolor='#ece2d6',        # 轨道(底槽)颜色
+                        bordercolor='#ece2d6',
                         thickness=12)                 # 条的高度(像素)，粗一点更醒目
 
         # --- 滚动条：同样换成主题色 ---
         style.configure('Vertical.TScrollbar',
-                        background='#c7cede',         # 滑块颜色
+                        background=C_BORDER_DK,       # 滑块颜色
                         troughcolor=C_BG,             # 轨道颜色
                         bordercolor=C_BG,
-                        arrowcolor='#ffffff',
+                        arrowcolor=C_PANEL,
                         width=12)
 
     # ---------------- UI 构建 ----------------
@@ -554,8 +564,8 @@ class FaceAlbumGUI:
 
         # 工具条：一个白色“面板”容器，把各种参数控件收在一起。
         # style='Panel.TFrame' 是我们下面临时“注册”的一个面板样式（白底无边框）。
-        top = ttk.Frame(self.root, style='Panel.TFrame', padding=(14, 10))
-        top.pack(fill=tk.X, padx=16, pady=(0, 8))   # padx/pady 让它四周留点边，像浮起的卡片
+        top = ttk.Frame(self.root, style='Panel.TFrame', padding=(16, 12))
+        top.pack(fill=tk.X, padx=18, pady=(0, 10))   # padx/pady 让它四周留点边，像浮起的卡片
         # 先注册 Panel 样式（tk.Frame 不能直接用 bg 参数做圆滑主题，用 style 最干净）：
         ttk.Style(self.root).configure('Panel.TFrame', background=C_PANEL)
 
@@ -601,13 +611,6 @@ class FaceAlbumGUI:
         row3 = ttk.Frame(top, style='Panel.TFrame')
         row3.pack(fill=tk.X, pady=(6, 0))
         ttk.Label(row3, text="📂 写入相册:", style='Panel.TLabel').pack(side=tk.LEFT)
-        # 总开关：勾上才允许把分类结果写到硬盘
-        # 注意用 tk.Checkbutton 而非 ttk.Checkbutton——clam 主题在部分 Windows 上
-        # 会把勾选符号渲染成“叉”，tk 原生的才能显示标准对勾 ✓（与上面的 GPU 加速一致）
-        tk.Checkbutton(row3, text="导出到硬盘", variable=self.export_enable,
-                       bg=C_PANEL, fg=C_TEXT, activebackground=C_PANEL,
-                       activeforeground=C_TEXT, selectcolor=C_PANEL,
-                       font=FONT).pack(side=tk.LEFT, padx=(4, 6))
         # 两种写入方式二选一：复制一份（原图不动）或 移动原图（原文件夹里就没有了）
         ttk.Radiobutton(row3, text="复制", value='copy',
                         variable=self.export_mode).pack(side=tk.LEFT, padx=(4, 2))
@@ -635,7 +638,7 @@ class FaceAlbumGUI:
                   style='Panel.TLabel', foreground=C_TEXT).pack(fill=tk.X)
         self.progress = ttk.Progressbar(status_panel, mode='determinate')
         # mode='determinate'：进度条有一个确定的最大值和当前值，用来显示 n/m
-        self.progress.pack(fill=tk.X, pady=(6, 0))
+        self.progress.pack(fill=tk.X, pady=(8, 0))
 
         # 主区域：可滚动画布。Canvas 是 Tk 里能“放东西还能滚动”的画布
         container = ttk.Frame(self.root)                     # 一个占满剩余空间的容器
@@ -1090,14 +1093,10 @@ class FaceAlbumGUI:
         """把分类好的照片按人物写进硬盘：每人一个文件夹，文件夹用人物名字命名。
 
         规则：
-          - 必须勾选了“导出到硬盘”总开关才执行；
           - 未分类的照片不导出（它们没名字，也没法定归属）；
           - 写入方式由单选决定：'copy'=复制一份（原图不动）；'move'=移动原图（原文件夹里就没它了）；
           - 没起名字的人物，文件夹用“人物N”兜底，保证每个都有地方放。
         """
-        if not self.export_enable.get():
-            messagebox.showinfo("提示", "请先勾选“导出到硬盘”，再点导出。")
-            return
         if self._busy:
             messagebox.showinfo("提示", "聚类还在跑，等它完成再导出。")
             return
@@ -1175,7 +1174,7 @@ class FaceAlbumGUI:
             r, c = divmod(i, cols)                # divmod(a,b) 一次给(a//b, a%b)，即(行,列)
             # ★美化：白底卡片，圆角感(靠四周内边距)+淡边框，悬停边框变主色
             card = tk.Frame(self.grid_frame, bg='white', padx=8, pady=8,
-                            highlightbackground=C_BORDER, highlightthickness=1)
+                            highlightbackground=C_BORDER, highlightthickness=2)
             card.grid(row=r, column=c, padx=12, pady=12, sticky='nsew')   # 放进网格(r,c)
             # sticky='nsew'：让卡片向东南西北四方“伸展”以填满格子
             self._bind_card_hover(card, C_CARD_HOV)   # ★美化：卡片悬停高亮
@@ -1244,7 +1243,7 @@ class FaceAlbumGUI:
         # 详情窗口里同样用一个可滚动 Canvas 铺照片网格（与主界面结构完全一致，可对照看）
         container = ttk.Frame(win)
         container.pack(fill=tk.BOTH, expand=True, padx=10, pady=(0, 10))
-        canvas = tk.Canvas(container, bg='#f2f2f2', highlightthickness=0)
+        canvas = tk.Canvas(container, bg=C_BG, highlightthickness=0)
         vsb = ttk.Scrollbar(container, orient="vertical", command=canvas.yview)
         canvas.configure(yscrollcommand=vsb.set)
         vsb.pack(side=tk.RIGHT, fill=tk.Y)
@@ -1269,7 +1268,7 @@ class FaceAlbumGUI:
         for i, item in enumerate(group['items']):   # 遍历这个人物组的每一张照片
             r, c = divmod(i, cols)
             frame = tk.Frame(gf, bg='white', padx=4, pady=4,
-                             highlightbackground='#d0d0d0', highlightthickness=1)
+                             highlightbackground=C_BORDER, highlightthickness=2)
             frame.grid(row=r, column=c, padx=8, pady=8, sticky='nsew')
 
             thumb = make_face_thumb(item['image'], item['bbox'], size=(200, 200))
