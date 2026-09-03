@@ -629,8 +629,8 @@ class FaceAlbumGUI:
 
         # 状态栏(一行文字)+进度条。anchor=tk.W 文字左对齐；progress 是横条进度条
         # ★美化：状态栏也放进一个白色圆角面板里，视觉上更整。
-        status_panel = ttk.Frame(self.root, style='Panel.TFrame', padding=(14, 8))
-        status_panel.pack(fill=tk.X, padx=16, pady=(0, 8))
+        status_panel = ttk.Frame(self.root, style='Panel.TFrame', padding=(16, 10))
+        status_panel.pack(fill=tk.X, padx=18, pady=(0, 10))
         ttk.Label(status_panel, textvariable=self.status_text, anchor=tk.W,
                   style='Panel.TLabel', foreground=C_TEXT).pack(fill=tk.X)
         self.progress = ttk.Progressbar(status_panel, mode='determinate')
