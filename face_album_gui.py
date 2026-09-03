@@ -295,10 +295,13 @@ def _reassign_to_nearest(emb, labels, centroids, min_score, qualities=None):
     # 默认所有人用同一个门槛 min_score
     thresholds = np.full(len(emb), min_score)
     if qualities is not None:
-        # 清楚分越低的（越模糊），门槛往下放得越多，最多放宽 0.1
-        # 例：清楚分 1.0 的门槛不变；清楚分 0.5 的门槛放宽 0.05
+        # 清楚分越低的（越模糊），门槛往下放得越多，最多放宽 0.1。
+        # 用幂函数 (1-q)^2：只有真正很模糊的脸才会放宽，
+        # 基本清楚的照片门槛几乎不动，避免“宽容”过头误并了不同的人。
+        # 例：清楚分 1.0 → 门槛不变；0.5 → 放宽 0.025；0.25 → 放宽 0.056
         relax = 0.10
-        thresholds = min_score - (1.0 - np.asarray(qualities)) * relax
+        blur = 1.0 - np.asarray(qualities)          # 模糊程度，0=最清，1=最糊
+        thresholds = min_score - (blur ** 2) * relax
 
     # 够得着各自门槛的归老大，够不着的一律当散脸
     new_labels = np.where(best_score >= thresholds,
