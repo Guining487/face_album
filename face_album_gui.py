@@ -1246,14 +1246,21 @@ class FaceAlbumGUI:
         canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
 
         gf = ttk.Frame(canvas)                 # gf = grid frame，内容承载器
-        canvas.create_window((0, 0), window=gf, anchor='nw')
+        gf_window = canvas.create_window((0, 0), window=gf, anchor='nw')
         gf.bind("<Configure>", lambda e: canvas.configure(scrollregion=canvas.bbox("all")))
+        # 画布变宽时，让内容 frame 跟着撑满整个宽度（否则照片只会挤在左边一列）
+        canvas.bind("<Configure>",
+                    lambda e: canvas.itemconfigure(gf_window, width=canvas.winfo_width())
+                    if canvas.winfo_width() > 1 else None)
         canvas.bind_all("<MouseWheel>",
                         lambda e: canvas.yview_scroll(int(-1 * (e.delta / 120)), "units"))
         # 注意这里的 lambda 没有存到变量，纯当作“匿名回调”用。e 是Tk传入的事件对象。
 
         refs = []   # 本窗口缩略图引用（防 GC），局部变量，等窗口关闭后被回收
         cols = GRID_COLS
+        # 让 cols 列等宽、平均拉伸，把整行铺满（否则照片会缩在左边）
+        for c in range(cols):
+            gf.columnconfigure(c, weight=1, uniform='detail_col')
         for i, item in enumerate(group['items']):   # 遍历这个人物组的每一张照片
             r, c = divmod(i, cols)
             frame = tk.Frame(gf, bg='white', padx=4, pady=4,
