@@ -75,7 +75,9 @@ from insightface.app import FaceAnalysis   # 现成人脸识别模型封装：�
 # C++ 里你写 const std::string kModelRoot = ...; Python 没有 const，全靠自觉不改它。
 # 名字带前导下划线 _xxx 是一种约定俗成：告诉别人“这是模块内部用的，别在外面碰”。
 _CANDIDATE_ROOTS = [          # 这是一个 list（列表）
-    r'E:\face_album\.insightface',   # r"..." 是原始字符串：反斜杠不转义，写Windows路径用它
+    # 优先使用“本脚本所在目录”下的 .insightface（随仓库走，方便移植）
+    os.path.join(os.path.dirname(os.path.abspath(__file__)), '.insightface'),
+    # 其次回退到当前用户主目录下的 .insightface（insightface 默认下载位置）
     os.path.join(os.path.expanduser('~'), '.insightface'),
     # os.path.expanduser('~') 会得到当前用户主目录，如 C:\Users\guigu
     # os.path.join(a,b) 是“跨平台拼路径”，自动加对的正斜杠/反斜杠，别自己写 '\\'

@@ -1,4 +1,25 @@
-/test_out
-/test_out2
-/test_photos
-/__pycache__
+# ---- Python ----
+__pycache__/
+*.py[cod]
+*.pyo
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.venv/
+venv/
+
+# ---- insightface 模型（自动下载，不入库） ----
+.insightface/
+
+# ---- 备份文件 ----
+*.bak
+*~
+
+# ---- 测试输出 / 测试照片 ----
+test_out/
+test_out2/
+test_photos/
+
+# ---- 编辑器 ----
+.vscode/
+.idea/
