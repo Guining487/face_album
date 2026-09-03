@@ -602,7 +602,12 @@ class FaceAlbumGUI:
         row3.pack(fill=tk.X, pady=(6, 0))
         ttk.Label(row3, text="📂 写入相册:", style='Panel.TLabel').pack(side=tk.LEFT)
         # 总开关：勾上才允许把分类结果写到硬盘
-        ttk.Checkbutton(row3, text="导出到硬盘", variable=self.export_enable).pack(side=tk.LEFT, padx=(4, 6))
+        # 注意用 tk.Checkbutton 而非 ttk.Checkbutton——clam 主题在部分 Windows 上
+        # 会把勾选符号渲染成“叉”，tk 原生的才能显示标准对勾 ✓（与上面的 GPU 加速一致）
+        tk.Checkbutton(row3, text="导出到硬盘", variable=self.export_enable,
+                       bg=C_PANEL, fg=C_TEXT, activebackground=C_PANEL,
+                       activeforeground=C_TEXT, selectcolor=C_PANEL,
+                       font=FONT).pack(side=tk.LEFT, padx=(4, 6))
         # 两种写入方式二选一：复制一份（原图不动）或 移动原图（原文件夹里就没有了）
         ttk.Radiobutton(row3, text="复制", value='copy',
                         variable=self.export_mode).pack(side=tk.LEFT, padx=(4, 2))
