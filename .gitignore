@@ -20,6 +20,10 @@ test_out/
 test_out2/
 test_photos/
 
+# ---- PyInstaller 打包产物（文件超过 GitHub 100MB 限制，不入库） ----
+build/
+dist/
+
 # ---- 编辑器 ----
 .vscode/
 .idea/
