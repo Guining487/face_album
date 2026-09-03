@@ -55,10 +55,12 @@
 # ---------------------------------------------------------------------------
 import os            # 操作系统功能：路径拼接、遍历目录、打开文件(startfile)等
 import sys           # 解释器相关：这里没直接用，属常见标配导入
+import re            # 正则表达式：导出相册时把不能当文件夹名的字符清掉
+import shutil        # 文件操作：复制(shutil.copy2) / 移动(shutil.move) 原图
 import threading     # 线程库。创建后台线程去跑耗时的人脸检测，避免界面“假死”
 import queue         # 线程安全的消息队列：后台线程算完把结果塞进来，主线程取走更新界面
 import tkinter as tk  # Python 自带的 GUI 库(Tk)。下面所有窗口控件都是它提供的
-from tkinter import ttk, filedialog, messagebox
+from tkinter import ttk, filedialog, messagebox, simpledialog
 # “from 模块 import 名字A, 名字B” 意思是：只把 A/B 直接拿进来用。
 # 区别：
 #   import tkinter as tk        -> 要用 tk.Tk()，前缀不能省（as 是给模块起个短别名）
@@ -295,13 +297,10 @@ def _reassign_to_nearest(emb, labels, centroids, min_score, qualities=None):
     # 默认所有人用同一个门槛 min_score
     thresholds = np.full(len(emb), min_score)
     if qualities is not None:
-        # 清楚分越低的（越模糊），门槛往下放得越多，最多放宽 0.1。
-        # 用幂函数 (1-q)^2：只有真正很模糊的脸才会放宽，
-        # 基本清楚的照片门槛几乎不动，避免“宽容”过头误并了不同的人。
-        # 例：清楚分 1.0 → 门槛不变；0.5 → 放宽 0.025；0.25 → 放宽 0.056
+        # 清楚分越低的（越模糊），门槛往下放得越多，最多放宽 0.1
+        # 例：清楚分 1.0 的门槛不变；清楚分 0.5 的门槛放宽 0.05
         relax = 0.10
-        blur = 1.0 - np.asarray(qualities)          # 模糊程度，0=最清，1=最糊
-        thresholds = min_score - (blur ** 2) * relax
+        thresholds = min_score - (1.0 - np.asarray(qualities)) * relax
 
     # 够得着各自门槛的归老大，够不着的一律当散脸
     new_labels = np.where(best_score >= thresholds,
@@ -441,15 +440,20 @@ class FaceAlbumGUI:
         self.min_cluster = tk.IntVar(value=2)           # 最少照片数，整数，默认 2
         self.use_gpu = tk.BooleanVar(value=True)        # “GPU加速”勾选框，默认勾上
         self.status_text = tk.StringVar(value="就绪 —— 请选择照片文件夹")  # 底部状态栏文字
+        self.export_enable = tk.BooleanVar(value=False) # “写入相册到硬盘”总开关，默认关
+        self.export_mode = tk.StringVar(value='copy')   # 写入方式：'copy'=复制 / 'move'=移动原图
         self.app = None              # insightface 模型对象。None 表示“还没加载”
         #                               空值占位，第一次真正用之前再建(见 _cluster_worker 懒加载)
-        self.groups = []             # 聚类结果。每个元素是 {'type':..., 'items':[...]}
+        self.groups = []             # 聚类结果。每个元素是 {'type':..., 'items':[...], 'name':...}
         #                               这是个 list，将来装 dict。dict 以 {键:值} 存取
+        #                               'name' 是用户给人物起的名字（未命名则为空）
         self._busy = False           # 是否正有一轮聚类在后台跑。
         #                              防止用户反复点“开始聚类”叠加出多个后台线程——
         #                              多个线程同时读高清大图 + 并发调用模型，内存成倍叠加，
         #                              最终被系统杀掉闪退。这个开关保证“同时只有一轮”。
         self._thumb_refs = []        # 保存缩略图引用，防被垃圾回收(GC)提前清掉(见下)
+        self._watermark_img = None   # 背景水印的 PhotoImage 对象（防 GC，保引用）
+        self._watermark_id = None    # 水印图片在画布上的编号（移动/删除它要用）
         self.msg_queue = queue.Queue()   # 线程安全队列：后台线程->界面线程传消息用
         # queue.Queue() 内部带锁，多线程往里 put / get 都不会乱，不用像 C++ 那样自己加 mutex。
 
@@ -587,6 +591,25 @@ class FaceAlbumGUI:
         ttk.Button(row1, text="?", width=3,
                    command=self._show_help).pack(side=tk.RIGHT)
 
+        # 第三行：导出相册设置——是否写入硬盘、复制还是移动原图、一键导出
+        row3 = ttk.Frame(top, style='Panel.TFrame')
+        row3.pack(fill=tk.X, pady=(6, 0))
+        ttk.Label(row3, text="📂 写入相册:", style='Panel.TLabel').pack(side=tk.LEFT)
+        # 总开关：勾上才允许把分类结果写到硬盘
+        ttk.Checkbutton(row3, text="导出到硬盘", variable=self.export_enable).pack(side=tk.LEFT, padx=(4, 6))
+        # 两种写入方式二选一：复制一份（原图不动）或 移动原图（原文件夹里就没有了）
+        ttk.Radiobutton(row3, text="复制", value='copy',
+                        variable=self.export_mode).pack(side=tk.LEFT, padx=(4, 2))
+        ttk.Radiobutton(row3, text="移动原图", value='move',
+                        variable=self.export_mode).pack(side=tk.LEFT, padx=(0, 8))
+        # 导出按钮：点击后选输出文件夹，按人物名字建子文件夹，把照片写进去
+        self._export_btn = ttk.Button(row3, text="导出相册 ▶", command=self._export_album)
+        self._export_btn.pack(side=tk.LEFT, padx=(4, 6))
+        # 一行小字提醒：没起名字的人物会按“人物N”导出
+        ttk.Label(row3, text="（给人物起好名字，子文件夹就用名字；没起名的用“人物N”）",
+                  style='Panel.TLabel', font=FONT_SMALL,
+                  foreground=C_TEXT_SUB).pack(side=tk.LEFT)
+
         # 第二行：一行小字提示“点击卡片可查看该人物全部照片”，弱化显示不抢戏
         ttk.Label(top, text="💡 提示：聚类完成后，点击任意人物卡片可查看该人物的全部照片；"
                             "点击照片可用系统默认程序打开原图。",
@@ -618,9 +641,10 @@ class FaceAlbumGUI:
         # 真正承载内容的是一个普通 Frame，把它“嵌”进画布：
         # ★美化：给内容区设置透明背景(不指定 bg 时 ttk.Frame 会用全局 C_BG)，卡片铺在上面
         self.grid_frame = ttk.Frame(self.canvas)
+        # ★美化：先铺一层“萌妹水印”当底（bg.png），免得聚类时/没结果时窗口大片空白光秃秃。
+        #   注意顺序：水印 image 先创建、后创建的 grid_frame 窗口盖在上面，不会挡住卡片。
+        self._draw_watermark()
         self.canvas.create_window((0, 0), window=self.grid_frame, anchor='nw')
-        # create_window：把这个 Frame 作为画布里的一个“子窗口”，放在坐标(0,0)，
-        # anchor='nw' = 以 Frame 的左上角(north-west)对准该点。
         # bind("<Configure>", 回调)：每当 Frame 尺寸改变就触发，自动更新画布可滚动范围。
         self.grid_frame.bind("<Configure>",
                              lambda e: self.canvas.configure(scrollregion=self.canvas.bbox("all")))
@@ -648,6 +672,35 @@ class FaceAlbumGUI:
                  bg=C_PANEL, fg=C_TEXT_SUB, font=FONT,
                  justify=tk.CENTER).pack(pady=(0, 26))
         # \n 是换行符。foreground 文字色；justify=CENTER 居中
+
+    # ---------------- ★美化：背景水印 ----------------
+    def _draw_watermark(self):
+        """在画布上铺一张半透明的萌妹图当水印，避免窗口大片空白太单调。
+
+        做法：
+          - 读取项目里的 bg.png（萌妹背景图）；
+          - 把它的透明度和尺寸调低，做成“淡淡的底图”；
+          - 画到画布左上角（先画，这样之后创建的卡片窗口会盖在它上面）。
+        读图失败（比如图被删了）就什么都不画，不影响程序使用。
+        """
+        try:
+            # 图片路径取“脚本所在目录/bg.png”，不写死具体盘符
+            bg_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'bg.png')
+            if not os.path.exists(bg_path):
+                return                       # 没这张图就算了
+            im = Image.open(bg_path).convert('RGBA')   # 打开并统一成 RGBA（带透明通道）
+            im.thumbnail((500, 500), Image.Resampling.LANCZOS)   # 缩到 500px 内，别太占地方
+            # 把整张图调成 28% 不透明度：太实会抢镜头，太虚又看不见
+            alpha = im.split()[3]            # 取出原来的透明通道
+            alpha = alpha.point(lambda a: int(a * 0.28))   # 每个像素透明度×0.28
+            im.putalpha(alpha)               # 写回新的透明通道
+            self._watermark_img = ImageTk.PhotoImage(im)   # 转成 Tk 能显示的图（要保引用）
+            # 画到画布 (20, 20) 位置，锚点=左上角。这张图没有绑定窗口，不随内容滚动。
+            self._watermark_id = self.canvas.create_image(20, 20, image=self._watermark_img,
+                                                          anchor='nw')
+        except Exception:
+            self._watermark_img = None       # 任何失败都安静跳过，不让程序报错崩掉
+            self._watermark_id = None
 
     # ---------------- ★美化：顶栏标题横幅 ----------------
     def _build_header(self):
@@ -810,7 +863,7 @@ class FaceAlbumGUI:
             # ★ 上面一行就完成了“所有行各自归一化”，numpy 是向量化计算，
             #    相当于 C++ 里一个循环 + SIMD，但写起来是一句。这就是 numpy 的威力。
 
-            self.msg_queue.put(('status', "正在聚类（先粗分，再认老大、认亲合并）..."))
+            self.msg_queue.put(('status', "正在聚类，请耐心等待..."))
             # 用升级后的聚类：不再一把尺子量到底，而是
             #   粗分 → 每堆算“平均脸”当老大 → 每张脸重新认老大 → 两个老大太像就并堆，
             # 反复几遍，错分漏分的脸都会被纠正回来（详见 smart_cluster 上方的说明）。
@@ -838,8 +891,9 @@ class FaceAlbumGUI:
             sorted_persons = sorted(persons.values(), key=lambda x: -len(x))
             # persons.values() 是字典里所有“值”(这里是各人物组)组成的视图
             # 列表推导式：把每组套一个dict外壳。结果形如
-            #   [{'type':'person','items':[原图1,原图2,...]}, ...]
-            groups = [{'type': 'person', 'items': g} for g in sorted_persons]
+            #   [{'type':'person','name':'','items':[原图1,原图2,...]}, ...]
+            # 'name' 是人物名字，默认空字符串，用户点“命名”后才会填上（导出时当文件夹名）
+            groups = [{'type': 'person', 'name': '', 'items': g} for g in sorted_persons]
             if unclassified:                 # 有噪声才追加“未分类”组（空组没意义）
                 groups.append({'type': 'unclassified', 'items': unclassified})
 
@@ -908,6 +962,95 @@ class FaceAlbumGUI:
         widget.bind("<Leave>", lambda e: widget.config(highlightbackground=C_BORDER))
         # 鼠标一走，边框颜色恢复成默认的淡色
 
+    # ---------------- 命名人物 ----------------
+    def _rename_group(self, group):
+        """给某个人物起名字：弹输入框，把名字存进这组的 'name' 字段，然后刷新卡片"""
+        # simpledialog.askstring = 弹一个“输入框”小窗，返回用户敲的文字；点取消返回 None
+        new_name = simpledialog.askstring(
+            "命名人物",
+            "给这位人物起个名字（导出相册时子文件夹就用这个名字）：\n"
+            "留空或点取消 = 不改名。",
+            parent=self.root,
+            initialvalue=group.get('name', ''))   # 默认填上次起过的名字
+        if new_name is not None and new_name.strip():
+            group['name'] = new_name.strip()      # 存进这组（字典可变，直接改）
+            self._render_groups()                 # 重画卡片，让新名字显示出来
+
+    # ---------------- 导出相册到硬盘 ----------------
+    def _export_album(self):
+        """把分类好的照片按人物写进硬盘：每人一个文件夹，文件夹用人物名字命名。
+
+        规则：
+          - 必须勾选了“导出到硬盘”总开关才执行；
+          - 未分类的照片不导出（它们没名字，也没法定归属）；
+          - 写入方式由单选决定：'copy'=复制一份（原图不动）；'move'=移动原图（原文件夹里就没它了）；
+          - 没起名字的人物，文件夹用“人物N”兜底，保证每个都有地方放。
+        """
+        if not self.export_enable.get():
+            messagebox.showinfo("提示", "请先勾选“导出到硬盘”，再点导出。")
+            return
+        if self._busy:
+            messagebox.showinfo("提示", "聚类还在跑，等它完成再导出。")
+            return
+        # 先取出有名字或至少有归属的人物组；未分类跳过
+        persons = [g for g in self.groups if g['type'] == 'person']
+        if not persons:
+            messagebox.showwarning("提示", "还没有可导出的人物，先聚类试试。")
+            return
+        # 选一个输出文件夹（导出时会在这里面按人物建子文件夹）
+        out_root = filedialog.askdirectory(title="选择相册输出文件夹（将在此目录下按人物建子文件夹）")
+        if not out_root:
+            return
+
+        # 一个文件夹里不能有重名文件：重名就自动加 _2、_3……
+        mode = self.export_mode.get()     # 'copy' 或 'move'
+        copied = 0               # 统计：成功写了几张
+        skipped = 0              # 统计：跳过几张（文件不存在等原因）
+
+        # 逐个处理每个人物
+        for i, group in enumerate(persons):
+            # 文件夹名优先用人名；没人名用“人物N”兜底
+            folder = group.get('name') or f"人物{i + 1}"
+            # 文件夹名不能含 Windows 禁止的字符 < > : " / \ | ? *，把它们清掉
+            folder = re.sub(r'[<>:"/\\|?*]', '', folder).strip() or f"人物{i + 1}"
+            folder_path = os.path.join(out_root, folder)
+            try:
+                os.makedirs(folder_path, exist_ok=True)   # 建子文件夹（已存在就忽略）
+            except Exception:
+                messagebox.showerror("错误", f"无法创建文件夹：{folder_path}")
+                return
+
+            # 把这个人的每张照片复制/移动过去
+            for item in group['items']:
+                src = item['image']
+                if not os.path.isfile(src):          # 原图找不到了就跳过
+                    skipped += 1
+                    continue
+                base = os.path.basename(src)         # 原名，如 photo.jpg
+                dst = os.path.join(folder_path, base)
+                # 若目标已有同名文件（不同子目录撞名），加个 _2 再试
+                n = 2
+                while os.path.exists(dst):
+                    stem, ext = os.path.splitext(base)
+                    dst = os.path.join(folder_path, f"{stem}_{n}{ext}")
+                    n += 1
+                try:
+                    if mode == 'move':
+                        shutil.move(src, dst)        # 移动原图（原位置就没有了）
+                    else:
+                        shutil.copy2(src, dst)       # 复制一份（原图保留）
+                    copied += 1
+                except Exception:
+                    skipped += 1                    # 单个失败不中断，继续写下一张
+
+        # 收尾：弹窗告诉用户结果
+        word = "移动" if mode == 'move' else "复制"
+        messagebox.showinfo(
+            "导出完成",
+            f"已{word} {copied} 张照片到：\n{out_root}\n"
+            + (f"（{skipped} 张因原图缺失或写入失败被跳过）" if skipped else "")
+            + "\n\n未分类的照片没有导出。")
+
     # ---------------- 渲染人物网格 ----------------
     def _render_groups(self):
         """把聚类结果渲染成人物卡片网格（每张卡片用该人物第一张脸作缩略图）"""
@@ -950,16 +1093,23 @@ class FaceAlbumGUI:
                 self._thumb_refs.append(thumb)   # 再存一份引用，双保险
 
             # 卡片下方的标题文字：未分类组 / 普通人物组
-            # ★美化：分两行显示——“人物 N”加粗大一点，“共 M 张”用灰色小字。
+            # ★美化：分两行显示——标题加粗大一点，“共 M 张”用灰色小字。
+            # 人物名字：用户起过名就用名字，没起名就先叫“人物 N”（未分类固定叫“未分类”）
             if group['type'] == 'unclassified':
                 title = "未分类"
             else:
-                title = f"人物 {i + 1}"
+                title = group.get('name') or f"人物 {i + 1}"
             ttk.Label(card, text=title, font=FONT_BOLD,
                       background='white').pack(pady=(10, 0))
             ttk.Label(card, text=f"共 {len(group['items'])} 张",
                       font=FONT_SMALL, background='white',
                       foreground=C_TEXT_SUB).pack(pady=(0, 4))
+
+            # 人物组才有“命名”按钮：点一下弹输入框起个名字，方便导出时当文件夹名。
+            # 未分类不允许命名（也不导出），所以不给按钮。
+            if group['type'] == 'person':
+                ttk.Button(card, text="✏️ 命名", width=8,
+                           command=lambda g=group: self._rename_group(g)).pack(pady=(2, 0))
             # pady=(6,0)：上下留白 (上6, 下0)。很多Tk参数接受(左右/上下)这种元组。
 
     # ---------------- 人物详情窗口 ----------------
@@ -969,7 +1119,9 @@ class FaceAlbumGUI:
         if group['type'] == 'unclassified':
             win.title(f"未分类 · 共 {len(group['items'])} 张照片")
         else:
-            win.title(f"人物 {idx + 1} · 共 {len(group['items'])} 张照片")
+            # 详情窗口标题也带上人物名字（有名字用名字，没名字用“人物N”）
+            gname = group.get('name') or f"人物 {idx + 1}"
+            win.title(f"{gname} · 共 {len(group['items'])} 张照片")
         win.geometry("1050x720")       # 子窗口大小
         win.minsize(700, 500)          # 最小尺寸
 
