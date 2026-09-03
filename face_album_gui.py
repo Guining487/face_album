@@ -68,7 +68,7 @@ from tkinter import ttk, filedialog, messagebox, simpledialog
 #   ttk   = 带样式的“高级控件”  filedialog = 系统“选文件夹”对话框  messagebox = 弹窗提示
 import numpy as np   # np 是 numpy 的惯用别名。numpy 提供高性能数组与数学函数
 import cv2           # OpenCV。注意 cv2.imread 读进来的图 = 一个 numpy 数组
-from PIL import Image, ImageTk   # Pillow 图像库：缩略图缩放；ImageTk 把图转成 Tk 能显示的
+from PIL import Image, ImageTk, ImageDraw   # Pillow 图像库：缩略图缩放；ImageTk 把图转成 Tk 能显示的；ImageDraw 用来画简笔画
 from sklearn.cluster import DBSCAN   # 聚类算法：把“相似的人脸特征”自动归成同一个人
 from insightface.app import FaceAnalysis   # 现成人脸识别模型封装：检测脸+提取512维特征
 
@@ -452,8 +452,8 @@ class FaceAlbumGUI:
         #                              多个线程同时读高清大图 + 并发调用模型，内存成倍叠加，
         #                              最终被系统杀掉闪退。这个开关保证“同时只有一轮”。
         self._thumb_refs = []        # 保存缩略图引用，防被垃圾回收(GC)提前清掉(见下)
-        self._watermark_img = None   # 背景水印的 PhotoImage 对象（防 GC，保引用）
-        self._watermark_id = None    # 水印图片在画布上的编号（移动/删除它要用）
+        self._watermark_imgs = []    # 背景水印所有姿势的 PhotoImage 对象（防 GC，保引用）
+        self._watermark_ids = []     # 背景水印所有贴纸在画布上的编号列表（重铺/删除要用）
         self.msg_queue = queue.Queue()   # 线程安全队列：后台线程->界面线程传消息用
         # queue.Queue() 内部带锁，多线程往里 put / get 都不会乱，不用像 C++ 那样自己加 mutex。
 
@@ -585,7 +585,13 @@ class FaceAlbumGUI:
         ttk.Label(row1, text="最少张数:", style='Panel.TLabel').pack(side=tk.LEFT, padx=(8, 2))
         ttk.Entry(row1, textvariable=self.min_cluster, width=4).pack(side=tk.LEFT)  # 张数输入框
         # Checkbutton = 勾选框。variable 绑到 BooleanVar，勾没勾都记在 use_gpu 里
-        ttk.Checkbutton(row1, text="⚡ GPU 加速", variable=self.use_gpu).pack(side=tk.LEFT, padx=10)
+        # 注意：这里故意用 tk.Checkbutton（经典样式）而不是 ttk.Checkbutton——
+        # ttk 的 clam 主题在部分 Windows 上勾选符号会渲染成“叉”，看不清是勾还是没勾，
+        # 换成 tk 原生勾选框后，打勾就显示标准对勾 ✓，一目了然。
+        tk.Checkbutton(row1, text="⚡ GPU 加速", variable=self.use_gpu,
+                       bg=C_PANEL, fg=C_TEXT, activebackground=C_PANEL,
+                       activeforeground=C_TEXT, selectcolor=C_PANEL,
+                       font=FONT).pack(side=tk.LEFT, padx=10)
 
         # ★美化：右侧放一个“帮助”小按钮，新手点它就能看到参数说明（见 _show_help）
         ttk.Button(row1, text="?", width=3,
@@ -644,7 +650,10 @@ class FaceAlbumGUI:
         # ★美化：先铺一层“萌妹水印”当底（bg.png），免得聚类时/没结果时窗口大片空白光秃秃。
         #   注意顺序：水印 image 先创建、后创建的 grid_frame 窗口盖在上面，不会挡住卡片。
         self._draw_watermark()
-        self.canvas.create_window((0, 0), window=self.grid_frame, anchor='nw')
+        # 记录 canvas 里嵌 grid_frame 的窗口编号，方便下面让它跟着画布一起变宽
+        self._grid_window = self.canvas.create_window((0, 0), window=self.grid_frame, anchor='nw')
+        # 画布一变宽，grid_frame 也跟着撑满整个宽度，卡片才不会只挤在左边
+        self.canvas.bind('<Configure>', self._on_canvas_resize)
         # bind("<Configure>", 回调)：每当 Frame 尺寸改变就触发，自动更新画布可滚动范围。
         self.grid_frame.bind("<Configure>",
                              lambda e: self.canvas.configure(scrollregion=self.canvas.bbox("all")))
@@ -657,50 +666,142 @@ class FaceAlbumGUI:
                              lambda e: self.canvas.yview_scroll(int(-1 * (e.delta / 120)), "units"))
         # bind_all = 给“所有控件”绑事件；int(-1*delta/120)：向上滚是正数，翻转成向上翻页
 
-        # 空状态提示：一开始啥都没聚出来，先放一段引导文字
-        # ★美化：做成“虚线卡片”样式的引导块，居中，配上主色调标题
-        self._empty_frame = tk.Frame(self.grid_frame, bg=C_PANEL,
-                                     highlightbackground=C_BORDER, highlightthickness=1)
-        self._empty_frame.grid(row=0, column=0, padx=20, pady=60)
-        tk.Label(self._empty_frame, text="📸", bg=C_PANEL,
-                 fg=C_ACCENT, font=('Microsoft YaHei', 42)).pack(pady=(26, 6))
-        tk.Label(self._empty_frame, text="欢迎使用 本地人脸聚类相册",
-                 bg=C_PANEL, fg=C_TEXT, font=FONT_TITLE).pack(pady=(0, 6))
-        tk.Label(self._empty_frame, text="选择照片文件夹后点击「开始聚类」\n"
-                                         "聚类完成后，每个人物会以第一张照片的人脸作为缩略图展示\n"
-                                         "点击人物卡片可查看该人物的全部照片",
-                 bg=C_PANEL, fg=C_TEXT_SUB, font=FONT,
-                 justify=tk.CENTER).pack(pady=(0, 26))
-        # \n 是换行符。foreground 文字色；justify=CENTER 居中
+    # ---------------- ★美化：背景水印（透明线条动漫少女，平铺） ----------------
+    def _make_sticker(self, pose=0, size=200):
+        """画一个透明背景的“线条动漫少女”全身小人，用作很淡的水印。
 
-    # ---------------- ★美化：背景水印 ----------------
+        风格：日本动漫少女风、Q 版大头的全身像，只勾线不填色，
+        线条用很淡的灰紫色，透明度也压得很低——就像人民币上的水印，
+        若有若无，不抢画面内容。
+
+        pose 参数决定手臂姿势（0=举双手欢呼 / 1=挥手 / 2=叉腰 / 3=双手身前），
+        这样平铺时每个小人动作不一样，更生动可爱。
+        """
+        im = Image.new('RGBA', (size, size), (0, 0, 0, 0))   # 全透明底
+        d = ImageDraw.Draw(im)
+        ink = (110, 105, 125, 55)      # 水印线条色：灰紫 + 低透明度
+        L = 3                          # 主线条宽
+        s = size / 200.0               # 按目标尺寸整体缩放
+        cx = size // 2                 # 画布水平中线
+
+        # ---------- 头 ----------
+        hr = 42 * s                    # 头半径（Q版大头）
+        hy = 64 * s                    # 头心 y 坐标
+        d.ellipse([cx - hr * 1.15, hy - hr * 1.15,      # 头发大圆（比脸大一圈）
+                   cx + hr * 1.15, hy + hr * 0.85], outline=ink, width=L)
+        d.arc([cx - 9 * s, hy - hr * 1.7, cx + 9 * s, hy - hr * 0.9],   # 呆毛
+              200, 340, fill=ink, width=2)
+        d.ellipse([cx - hr, hy - hr, cx + hr, hy + hr], outline=ink, width=L)   # 脸
+        for dx in (-hr * 0.5, 0, hr * 0.5):              # 刘海三道弧
+            d.arc([cx + dx - hr * 0.3, hy - hr * 0.75,
+                   cx + dx + hr * 0.3, hy - hr * 0.15], 180, 360, fill=ink, width=2)
+        for dx in (-hr * 0.35, hr * 0.35):               # 眯眼笑（^^）
+            d.arc([cx + dx - hr * 0.18, hy - hr * 0.05,
+                   cx + dx + hr * 0.18, hy + hr * 0.18], 20, 160, fill=ink, width=2)
+        d.arc([cx - hr * 0.15, hy + hr * 0.2, cx + hr * 0.15, hy + hr * 0.4],   # 嘴
+              20, 160, fill=ink, width=2)
+        for dx in (-hr * 0.7, hr * 0.7):                 # 腮红小圈（更淡）
+            d.ellipse([cx + dx - hr * 0.1, hy + hr * 0.08,
+                       cx + dx + hr * 0.1, hy + hr * 0.28],
+                      outline=(110, 105, 125, 35), width=2)
+
+        # ---------- 身体：连衣裙剪影（梯形） ----------
+        top = hy + hr * 0.9            # 肩线 y
+        bot = size - 26 * s            # 裙摆 y
+        waist = hy + hr * 1.7          # 腰线 y
+        d.line([(cx - 26 * s, top), (cx - 40 * s, bot)], fill=ink, width=L)   # 左裙边
+        d.line([(cx + 26 * s, top), (cx + 40 * s, bot)], fill=ink, width=L)   # 右裙边
+        d.line([(cx - 40 * s, bot), (cx + 40 * s, bot)], fill=ink, width=L)   # 裙摆边
+        d.line([(cx - 20 * s, top), (cx, top + 14 * s)], fill=ink, width=2)   # 领口 V 左
+        d.line([(cx + 20 * s, top), (cx, top + 14 * s)], fill=ink, width=2)   # 领口 V 右
+        d.line([(cx - 22 * s, waist), (cx + 22 * s, waist)], fill=ink, width=2)   # 腰线
+
+        # ---------- 手臂（按姿势变化，这是让小人动作不同的关键） ----------
+        sh_l, sh_r = (cx - 26 * s, top), (cx + 26 * s, top)   # 左右肩点
+        if pose == 0:        # 举双手欢呼
+            d.line([sh_l, (cx - 30 * s, top - 26 * s), (cx - 14 * s, top - 30 * s)], fill=ink, width=L)
+            d.line([sh_r, (cx + 30 * s, top - 26 * s), (cx + 14 * s, top - 30 * s)], fill=ink, width=L)
+        elif pose == 1:      # 挥手（右臂举起，左臂垂放）
+            d.line([sh_l, (cx - 36 * s, top + 8 * s)], fill=ink, width=L)
+            d.line([sh_r, (cx + 32 * s, top - 22 * s), (cx + 20 * s, top - 26 * s)], fill=ink, width=L)
+        elif pose == 2:      # 叉腰
+            d.line([sh_l, (cx - 34 * s, top + 14 * s)], fill=ink, width=L)
+            d.line([sh_r, (cx + 34 * s, top + 14 * s)], fill=ink, width=L)
+        else:                # 双手放身前（害羞）
+            d.line([sh_l, (cx - 14 * s, waist)], fill=ink, width=L)
+            d.line([sh_r, (cx + 14 * s, waist)], fill=ink, width=L)
+
+        # ---------- 腿 ----------
+        d.line([(cx - 18 * s, bot - 4 * s), (cx - 16 * s, size - 10 * s)], fill=ink, width=L)
+        d.line([(cx + 18 * s, bot - 4 * s), (cx + 16 * s, size - 10 * s)], fill=ink, width=L)
+        for dx in (-16 * s, 16 * s):                       # 小鞋底
+            d.line([(cx + dx - 6 * s, size - 10 * s), (cx + dx + 6 * s, size - 10 * s)], fill=ink, width=2)
+        return im
+
     def _draw_watermark(self):
-        """在画布上铺一张半透明的萌妹图当水印，避免窗口大片空白太单调。
+        """把自绘的透明线条少女平铺到画布背景，让窗口空白处不单调。
 
         做法：
-          - 读取项目里的 bg.png（萌妹背景图）；
-          - 把它的透明度和尺寸调低，做成“淡淡的底图”；
-          - 画到画布左上角（先画，这样之后创建的卡片窗口会盖在它上面）。
-        读图失败（比如图被删了）就什么都不画，不影响程序使用。
+          - 生成 4 种不同姿势的小人（透明底、纯线条、很淡）；
+          - 按网格平铺，相邻贴不同姿势，动作错开更可爱；
+          - 窗口大小变化时自动重铺，始终贴合窗口。
+        注意事项：水印 image 先画、后创建的卡片窗口盖在上面，不会挡住内容。
         """
         try:
-            # 图片路径取“脚本所在目录/bg.png”，不写死具体盘符
-            bg_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'bg.png')
-            if not os.path.exists(bg_path):
-                return                       # 没这张图就算了
-            im = Image.open(bg_path).convert('RGBA')   # 打开并统一成 RGBA（带透明通道）
-            im.thumbnail((500, 500), Image.Resampling.LANCZOS)   # 缩到 500px 内，别太占地方
-            # 把整张图调成 28% 不透明度：太实会抢镜头，太虚又看不见
-            alpha = im.split()[3]            # 取出原来的透明通道
-            alpha = alpha.point(lambda a: int(a * 0.28))   # 每个像素透明度×0.28
-            im.putalpha(alpha)               # 写回新的透明通道
-            self._watermark_img = ImageTk.PhotoImage(im)   # 转成 Tk 能显示的图（要保引用）
-            # 画到画布 (20, 20) 位置，锚点=左上角。这张图没有绑定窗口，不随内容滚动。
-            self._watermark_id = self.canvas.create_image(20, 20, image=self._watermark_img,
-                                                          anchor='nw')
+            # 4 种姿势各画一张，轮流铺，小人动作不一样
+            self._watermark_imgs = [
+                ImageTk.PhotoImage(self._make_sticker(pose=i)) for i in range(4)
+            ]
+            # 窗口尺寸变化时的重铺动作交给 _on_canvas_resize 统一处理
+            self._layout_watermark()
         except Exception:
-            self._watermark_img = None       # 任何失败都安静跳过，不让程序报错崩掉
-            self._watermark_id = None
+            self._watermark_imgs = []       # 任何失败都安静跳过，不让程序报错崩掉
+
+    def _layout_watermark(self):
+        """把 4 种姿势的水印小人按网格铺满画布（交替出现，带空隙）。"""
+        try:
+            # 先删掉上一次铺的所有贴纸（避免窗口一变就叠一堆）
+            if self._watermark_ids:
+                self.canvas.delete(*self._watermark_ids)
+                self._watermark_ids = []
+            if not self._watermark_imgs:
+                return
+            w = self.canvas.winfo_width() or 1      # 画布当前宽（还没布局时取不到就先用1）
+            h = self.canvas.winfo_height() or 1     # 画布当前高
+            step = 200 + 50                         # 小人 200 宽 + 50 间距，留呼吸空间
+            ids = []
+            y = 15
+            i = 0
+            while y < h - 30:
+                x = 15
+                while x < w - 30:
+                    img = self._watermark_imgs[i % len(self._watermark_imgs)]   # 轮换姿势
+                    ids.append(self.canvas.create_image(x, y, image=img, anchor='nw'))
+                    i += 1
+                    x += step
+                y += step
+            self._watermark_ids = ids              # 记住这次铺的所有 id，下次好清理
+        except Exception:
+            pass
+
+    def _on_canvas_resize(self, event):
+        """画布大小变化时统一处理：让卡片区跟着撑满宽度 + 重铺水印。
+
+        用 after_idle 把多次连续触发合并成一次，避免拖动窗口时疯狂重算。
+        """
+        self.root.after_idle(self._apply_canvas_layout)
+
+    def _apply_canvas_layout(self):
+        """真正执行布局：卡片区撑满画布宽度，水印重新铺一遍。"""
+        try:
+            w = self.canvas.winfo_width()
+            # 1) grid_frame 撑满画布宽度（卡片才不会只挤在左半边）
+            if self._grid_window is not None and w > 1:
+                self.canvas.itemconfigure(self._grid_window, width=w)
+            # 2) 水印跟着新尺寸重铺
+            self._layout_watermark()
+        except Exception:
+            pass
 
     # ---------------- ★美化：顶栏标题横幅 ----------------
     def _build_header(self):
@@ -719,6 +820,9 @@ class FaceAlbumGUI:
         # Label 的文字颜色 fg、背景 bg 都可以直接指定，配合我们的主题色。
         tk.Label(title_row, text="  · 自动识别照片里的人，按人物智能分组", bg=C_PANEL,
                  fg=C_TEXT_SUB, font=FONT_SUB).pack(side=tk.LEFT, padx=(10, 0), pady=(6, 0))
+        # ★ 欢迎词移到顶栏最右侧：楷书、加大加粗，一眼就能看到
+        tk.Label(title_row, text="欢迎使用 ♪", bg=C_PANEL,
+                 fg=C_ACCENT, font=('楷体', 18, 'bold')).pack(side=tk.RIGHT, pady=(4, 0))
 
     # ---------------- 交互 ----------------
     def _choose_dir(self):
@@ -1059,6 +1163,9 @@ class FaceAlbumGUI:
         self._thumb_refs.clear()          # 并释放旧缩略图引用
 
         cols = GRID_COLS                  # 每行 4 张卡片
+        # 让 4 列等宽、平均拉伸，把整行铺满（否则卡片会缩在左边）
+        for c in range(cols):
+            self.grid_frame.columnconfigure(c, weight=1, uniform='card_col')
         for i, group in enumerate(self.groups):   # 遍历每一组人物
             r, c = divmod(i, cols)                # divmod(a,b) 一次给(a//b, a%b)，即(行,列)
             # ★美化：白底卡片，圆角感(靠四周内边距)+淡边框，悬停边框变主色
