@@ -224,6 +224,138 @@ def make_face_thumb(image_path, bbox, size=(180, 180)):
 
 
 # ============================================================================
+# ★ 聚类升级：从“一把尺子量到底”变成“先粗分 + 认老大 + 认亲合并” ★
+#
+# 老办法是：给一个 eps 阈值，一把尺子量所有脸，够近就归一组（DBSCAN）。
+# 问题：有人照片多、有人照片少，光线角度还五花八门，一把尺子容易误判。
+#
+# 新办法学华为相册的思路，分三步走：
+#   1) 先粗分：还是用 DBSCAN 大概分一下，把明显是同一个人的先拢成几堆；
+#   2) 认老大：每堆照片算一张“平均脸”当这堆的“老大”，
+#      然后每张脸重新跟最像的老大认亲——不够像的踢出去，串堆的纠正回来；
+#   3) 认亲合并：两个堆的老大长得太像（比如同一个人不同年龄段被拆成两堆），
+#      就把这两堆合成一堆。
+# 以上 2、3 两步反复做几遍，结果越修越稳。
+# ============================================================================
+
+def _l2_normalize(emb):
+    """把每一行向量都拉成“长度=1”的单位向量。
+
+    两个单位向量的点积 = 它们的余弦相似度，也就是“这俩脸像不像”的分数，
+    范围在 -1~1 之间，越接近 1 越像。后面到处都要用相似度，先归一化省事。
+    """
+    return emb / (np.linalg.norm(emb, axis=1, keepdims=True) + 1e-9)
+
+
+def _group_centroids(emb, labels):
+    """给每个群算一张“平均脸”（centroid），当这群的“老大”。
+
+    平均脸 = 群里所有人脸特征向量求平均，再归一化。
+    它比单张照片“稳”：一个人的平均脸基本就代表这个人长啥样。
+    返回两个东西：
+      centroids: {群号: 平均脸向量}
+      groups:    {群号: [群里每个人脸的下标, ...]}
+    """
+    groups = {}
+    for i, lab in enumerate(labels):
+        if lab < 0:                      # -1 是没归属的“散脸”，先不拿它当老大
+            continue
+        groups.setdefault(int(lab), []).append(i)
+    centroids = {}
+    for lab, idxs in groups.items():
+        mean = emb[idxs].mean(axis=0)                 # 取平均
+        norm = np.linalg.norm(mean) + 1e-9            # 防止除以 0
+        centroids[lab] = mean / norm                  # 再归一化
+    return centroids, groups
+
+
+def _reassign_to_nearest(emb, labels, centroids, min_score):
+    """“认老大”这一步：让每张脸重新认领一个最像的群。
+
+    对每张脸：
+      - 算出它和每个老大（平均脸）的相似度，挑分数最高的那个；
+      - 如果最高分还够不到 min_score（“像到一定程度才算一家人”），
+        就把它标成 -1（散脸），最后进“未分类”；
+      - 够得着就归到那个老大名下（包括把 DBSCAN 漏掉的散脸也捡回来）。
+    这样能纠正 DBSCAN 错分、漏分的脸。
+    """
+    lab_list = list(centroids.keys())
+    if not lab_list:
+        return np.full(len(emb), -1, dtype=int)
+    # 把所有老大排成矩阵 C：每行一个老大，和 emb 一乘就一次算出所有相似度
+    C = np.stack([centroids[l] for l in lab_list])        # (群数, 512)
+    sims = emb @ C.T                                      # (脸数, 群数)
+    best = sims.argmax(axis=1)                            # 每张脸最像哪个老大
+    best_score = sims[np.arange(len(emb)), best]          # 那个老大给的分数
+    # 够得着阈值的归老大，够不着的一律当散脸
+    new_labels = np.where(best_score >= min_score,
+                          np.array([lab_list[b] for b in best]), -1)
+    return new_labels.astype(int)
+
+
+def _merge_close_groups(emb, labels, centroids, merge_score):
+    """“认亲合并”这一步：两个群的老大长得太像，就合成一个群。
+
+    为什么需要？同一个人不同年龄段的照片、或光线角度差很多的照片，
+    第一轮可能被拆成两堆。但两堆的平均脸依然很接近——
+    只要接近到 merge_score 这个程度，就认定是同一个人，并堆。
+    注意：merge_score 比认老大用的 min_score 更宽松（更愿意合并），
+    专门用来“认亲”，把被拆开的同一人拼回来。
+    """
+    lab_list = list(centroids.keys())
+    if len(lab_list) < 2:
+        return labels
+    C = np.stack([centroids[l] for l in lab_list])        # (群数, 512)
+    sim = C @ C.T                                         # 群与群之间的相似度矩阵
+    new_labels = np.array(labels)
+    for a in range(len(lab_list)):
+        for b in range(a + 1, len(lab_list)):
+            if sim[a][b] >= merge_score:
+                big, small = lab_list[a], lab_list[b]
+                # 把 b 群里的人全部并进 a 群
+                new_labels[new_labels == small] = big
+    return new_labels.astype(int)
+
+
+def smart_cluster(emb, eps, min_cluster, max_iters=3):
+    """聚类总入口：先粗分，再反复“认老大 + 认亲”几遍。
+
+    参数：
+      emb         已经归一化的人脸特征矩阵 (脸数, 512)
+      eps         用户填的阈值（距离），越小越严
+      min_cluster 最少几张同脸才算一个“人物”
+    返回：
+      labels      一维数组，第 i 个元素是第 i 张脸归的群号；-1 = 未分类
+    """
+    # 第一轮粗分：DBSCAN。因为输入已归一化，metric='cosine' 时
+    # 距离 = 1 - 相似度，所以 eps 正好等于“相似度多少才算一家人”的临界。
+    cl = DBSCAN(eps=eps, min_samples=min_cluster, metric='cosine')
+    labels = cl.fit_predict(emb)
+
+    # 把距离阈值换算成相似度阈值：
+    #   min_score  = 认老大要“至少像多少”；
+    #   merge_score = 认亲要“至少像多少”，比 min_score 更宽松（更愿意合并）。
+    min_score = 1.0 - eps
+    merge_score = 1.0 - eps * 1.2        # 默认比 eps 再放宽 20%，方便认亲
+
+    # 反复“认老大 → 认亲 → 再认老大”，每轮都会把结果修得更准一点
+    for _ in range(max_iters):
+        centroids, _ = _group_centroids(emb, labels)      # 先算出各群老大
+        if not centroids:
+            break
+        labels = _merge_close_groups(emb, labels, centroids, merge_score)
+        centroids, _ = _group_centroids(emb, labels)      # 合并完重算老大
+        labels = _reassign_to_nearest(emb, labels, centroids, min_score)
+
+    # 最后一道保险：群太小（没凑够 min_cluster 张）的不算人物，全丢进散脸
+    centroids, groups = _group_centroids(emb, labels)
+    for lab, idxs in groups.items():
+        if len(idxs) < min_cluster:
+            labels[np.array(idxs)] = -1
+    return labels
+
+
+# ============================================================================
 # 类 FaceAlbumGUI：整个图形界面的“主控制器”
 # ============================================================================
 # class ≈ C++ 的 class。成员变量/成员函数都写在它里面。
@@ -500,7 +632,11 @@ class FaceAlbumGUI:
             "    路人脸也占一个格子。\n\n"
             "GPU 加速\n"
             "    勾选后优先用显卡（NVIDIA）跑人脸模型，速度快很多；\n"
-            "    没有可用显卡时程序会自动退回 CPU。")
+            "    没有可用显卡时程序会自动退回 CPU。\n\n"
+            "小科普：聚类其实分三步走\n"
+            "    ① 先用 eps 粗分一次；② 每堆算一张‘平均脸’当老大，每张照片\n"
+            "    重新认老大（不像的就踢出去）；③ 两个老大长得太像（比如同一个人\n"
+            "    不同年龄段）就把两堆合并。反复几遍，结果会更准。")
 
     def _start_cluster(self):
         """读取并校验用户输入，清空旧结果后启动后台聚类线程"""
@@ -599,7 +735,7 @@ class FaceAlbumGUI:
                 return
 
             # ------------------------------------------------------------------
-            # 第三阶段：归一化 + DBSCAN 聚类
+            # 第三阶段：归一化 + 智能聚类（先粗分，再认老大、认亲合并）
             # ------------------------------------------------------------------
             # 把“列表 of 向量”变成一个二维 numpy 矩阵，形状 (人脸数, 512)
             emb = np.array(embeddings)
@@ -607,21 +743,21 @@ class FaceAlbumGUI:
             # 好处：两个都归一化后，点积就代表余弦相似度，判断“像不像”很简单。
             # np.linalg.norm(emb, axis=1) 对每行求长度；keepdims=True 保住维度好做除法；
             # +1e-9 防止除以0(加个小epsilon，数值上保险)。
-            emb = emb / (np.linalg.norm(emb, axis=1, keepdims=True) + 1e-9)
+            emb = _l2_normalize(emb)
             # ★ 上面一行就完成了“所有行各自归一化”，numpy 是向量化计算，
             #    相当于 C++ 里一个循环 + SIMD，但写起来是一句。这就是 numpy 的威力。
 
-            self.msg_queue.put(('status', "正在 DBSCAN 聚类..."))
-            # DBSCAN：把“距离近”的人脸归到同一簇。metric='cosine' 用余弦距离衡量相似度。
-            # eps 是距离阈值：小于它就认为同一个人。min_samples 最少要有几张才算一个人。
-            cl = DBSCAN(eps=eps, min_samples=min_cluster, metric='cosine')
-            labels = cl.fit_predict(emb)   # fit_predict = “训练+预测”一步到位，返回每张脸的标签
-            # 返回的 labels 是个一维数组，长度=人脸数。labels[i]=第i张脸属于哪个组。
-            # 特别地，标签 = -1 表示“噪声”：谁也够不着，归不进任何组。
+            self.msg_queue.put(('status', "正在聚类（先粗分，再认老大、认亲合并）..."))
+            # 用升级后的聚类：不再一把尺子量到底，而是
+            #   粗分 → 每堆算“平均脸”当老大 → 每张脸重新认老大 → 两个老大太像就并堆，
+            # 反复几遍，错分漏分的脸都会被纠正回来（详见 smart_cluster 上方的说明）。
+            labels = smart_cluster(emb, eps, min_cluster)
+            # labels 是个一维数组，长度=人脸数。labels[i]=第i张脸属于哪个组。
+            # 特别地，标签 = -1 表示“谁都不像”：归不进任何组，进“未分类”。
 
             # 分组：按标签把人脸归类。dict 的键是组号，值是这组的人脸信息列表
             persons = {}                    # 空字典
-            unclassified = []               # 装 -1 的噪声人脸
+            unclassified = []               # 装 -1 的散脸
             for idx, lab in enumerate(labels):   # 遍历所有标签
                 if lab == -1:
                     unclassified.append(metas[idx])
