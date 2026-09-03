@@ -269,15 +269,19 @@ def _group_centroids(emb, labels):
     return centroids, groups
 
 
-def _reassign_to_nearest(emb, labels, centroids, min_score):
+def _reassign_to_nearest(emb, labels, centroids, min_score, qualities=None):
     """“认老大”这一步：让每张脸重新认领一个最像的群。
 
     对每张脸：
       - 算出它和每个老大（平均脸）的相似度，挑分数最高的那个；
-      - 如果最高分还够不到 min_score（“像到一定程度才算一家人”），
+      - 如果最高分还够不到门槛（“像到一定程度才算一家人”），
         就把它标成 -1（散脸），最后进“未分类”；
       - 够得着就归到那个老大名下（包括把 DBSCAN 漏掉的散脸也捡回来）。
     这样能纠正 DBSCAN 错分、漏分的脸。
+
+    门槛不是一把尺子量到底：如果给了每张脸的“清楚分”（qualities），
+    越模糊的脸门槛就越放宽一点——因为模糊脸的特征本身就不准，
+    还拿和清晰脸一样的标准要求它，很容易把它冤枉成“散脸”。
     """
     lab_list = list(centroids.keys())
     if not lab_list:
@@ -287,8 +291,17 @@ def _reassign_to_nearest(emb, labels, centroids, min_score):
     sims = emb @ C.T                                      # (脸数, 群数)
     best = sims.argmax(axis=1)                            # 每张脸最像哪个老大
     best_score = sims[np.arange(len(emb)), best]          # 那个老大给的分数
-    # 够得着阈值的归老大，够不着的一律当散脸
-    new_labels = np.where(best_score >= min_score,
+
+    # 默认所有人用同一个门槛 min_score
+    thresholds = np.full(len(emb), min_score)
+    if qualities is not None:
+        # 清楚分越低的（越模糊），门槛往下放得越多，最多放宽 0.1
+        # 例：清楚分 1.0 的门槛不变；清楚分 0.5 的门槛放宽 0.05
+        relax = 0.10
+        thresholds = min_score - (1.0 - np.asarray(qualities)) * relax
+
+    # 够得着各自门槛的归老大，够不着的一律当散脸
+    new_labels = np.where(best_score >= thresholds,
                           np.array([lab_list[b] for b in best]), -1)
     return new_labels.astype(int)
 
@@ -317,13 +330,44 @@ def _merge_close_groups(emb, labels, centroids, merge_score):
     return new_labels.astype(int)
 
 
-def smart_cluster(emb, eps, min_cluster, max_iters=3):
+def _face_quality_score(image, bbox, det_score=1.0):
+    """给一张人脸打一个“清楚程度”分，0~1，越接近 1 越清楚。
+
+    为什么要打这个分？因为照片有清晰有模糊：清晰的脸特征很准，
+    模糊的脸（对焦差/手抖/像素低）特征本身就“毛”了。
+    如果两种脸用同一把尺子去比，模糊脸很容易认错人或者没人要。
+    所以我们要给每张脸估个清楚分，越模糊后面聚类时标准越放宽。
+
+    怎么算：
+      - 把脸那块从原图抠出来，用 Laplacian 算子看“边缘锐利度”，
+        照片越清楚，边缘越锐利，这个数值越大；
+      - 再结合人脸检测给的置信度（det_score，0~1），综合成一个分。
+    """
+    h, w = image.shape[:2]                 # 原图高、宽
+    x1, y1, x2, y2 = [int(v) for v in bbox]  # 人脸框四角坐标
+    x1 = max(0, x1); y1 = max(0, y1)          # 防止坐标越界，夹到图内
+    x2 = min(w, x2); y2 = min(h, y2)
+    crop = image[y1:y2, x1:x2]                # 把人脸那块抠出来
+    if crop is None or crop.size == 0:
+        return 0.0                            # 抠空了就当最模糊
+    gray = cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY)   # 转成灰度图才好算边缘
+    # Laplacian 方差：越大说明边缘越锐利 = 越清楚
+    laplacian_var = cv2.Laplacian(gray, cv2.CV_64F).var()
+    # 这个数值没有上限，经验上 500 左右已经算很清楚了，压到 0~1
+    sharpness = min(1.0, laplacian_var / 500.0)
+    # 清楚分 = 锐利度为主（7成），检测置信度为辅（3成）
+    return max(0.0, min(1.0, 0.7 * sharpness + 0.3 * det_score))
+
+
+def smart_cluster(emb, eps, min_cluster, max_iters=3, qualities=None):
     """聚类总入口：先粗分，再反复“认老大 + 认亲”几遍。
 
     参数：
       emb         已经归一化的人脸特征矩阵 (脸数, 512)
       eps         用户填的阈值（距离），越小越严
       min_cluster 最少几张同脸才算一个“人物”
+      qualities   每张脸的“清楚分”（0~1），可选。给了的话，
+                  模糊的脸认老大时门槛自动放宽，不容易被冤枉成散脸。
     返回：
       labels      一维数组，第 i 个元素是第 i 张脸归的群号；-1 = 未分类
     """
@@ -345,7 +389,8 @@ def smart_cluster(emb, eps, min_cluster, max_iters=3):
             break
         labels = _merge_close_groups(emb, labels, centroids, merge_score)
         centroids, _ = _group_centroids(emb, labels)      # 合并完重算老大
-        labels = _reassign_to_nearest(emb, labels, centroids, min_score)
+        labels = _reassign_to_nearest(emb, labels, centroids,
+                                      min_score, qualities)
 
     # 最后一道保险：群太小（没凑够 min_cluster 张）的不算人物，全丢进散脸
     centroids, groups = _group_centroids(emb, labels)
@@ -707,6 +752,7 @@ class FaceAlbumGUI:
             # 第二阶段：逐张图片做人脸检测 + 特征提取
             # ------------------------------------------------------------------
             embeddings = []   # 收集到的所有人脸 512 维特征（每张脸一个 512 元素的向量）
+            qualities = []    # 与 embeddings 一一对应：每张脸的“清楚分”（0~1），模糊=低分
             metas = []        # 与 embeddings 一一对应：记录这张脸来自哪张图、人脸框在哪
             total = len(images)
             for i, p in enumerate(images):
@@ -724,6 +770,9 @@ class FaceAlbumGUI:
                     metas.append({'image': p, 'bbox': face.bbox.tolist()})
                     # face.bbox 是人脸框(可能是numpy数组)，.tolist() 转成普通Python列表
                     # 这里塞的是一个 dict：{'image': 图片路径, 'bbox': [x1,y1,x2,y2]}
+                    # 顺手给这张脸估个“清楚分”，模糊的后面聚类时会放宽标准（见 _face_quality_score）
+                    qualities.append(_face_quality_score(img, face.bbox,
+                                                         float(face.det_score)))
                 if (i + 1) % 3 == 0 or i + 1 == total:   # 每3张(或最后一张)回报一次进度
                     # % 取余；or 是“逻辑或”。减少往队列塞消息的次数，降低开销
                     self.msg_queue.put(('progress', (i + 1, total,
@@ -751,7 +800,8 @@ class FaceAlbumGUI:
             # 用升级后的聚类：不再一把尺子量到底，而是
             #   粗分 → 每堆算“平均脸”当老大 → 每张脸重新认老大 → 两个老大太像就并堆，
             # 反复几遍，错分漏分的脸都会被纠正回来（详见 smart_cluster 上方的说明）。
-            labels = smart_cluster(emb, eps, min_cluster)
+            # 第三只脚：把每张脸的“清楚分”也传进去，模糊的脸自动放宽标准，不怕被冤枉。
+            labels = smart_cluster(emb, eps, min_cluster, qualities=qualities)
             # labels 是个一维数组，长度=人脸数。labels[i]=第i张脸属于哪个组。
             # 特别地，标签 = -1 表示“谁都不像”：归不进任何组，进“未分类”。
 
