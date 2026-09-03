@@ -14,6 +14,14 @@ a = Analysis(
     noarchive=False,
     optimize=0,
 )
+
+# ★ 剔除 onnxruntime 自带的 CUDA/cuDNN 大体积 DLL（合计约 2.5GB）。
+#   程序主要跑 CPU（GPU 勾选也只是优先尝试，失败会自动退回 CPU），
+#   不带这些库能保持 exe 只有一百多 MB，与之前的发布版一致。
+_CUDA_KW = ('cublas', 'cudnn', 'cuda', 'cudart', 'nvrtc', 'nvjitlink',
+            'cufft', 'curand', 'cusolver', 'cusparse')
+a.binaries = [b for b in a.binaries
+              if not any(k in b[0].lower() for k in _CUDA_KW)]
 pyz = PYZ(a.pure)
 
 exe = EXE(
@@ -22,7 +30,7 @@ exe = EXE(
     a.binaries,
     a.datas,
     [],
-    name='face_album',
+    name='人脸聚类相册',
     debug=False,
     bootloader_ignore_signals=False,
     strip=False,

@@ -59,6 +59,9 @@ import re            # 正则表达式：导出相册时把不能当文件夹名
 import shutil        # 文件操作：复制(shutil.copy2) / 移动(shutil.move) 原图
 import threading     # 线程库。创建后台线程去跑耗时的人脸检测，避免界面“假死”
 import queue         # 线程安全的消息队列：后台线程算完把结果塞进来，主线程取走更新界面
+import urllib.request  # 联网下载：首次使用下载人脸模型、按需下载 GPU 加速组件
+import json            # 解析 PyPI 接口，自动定位 onnxruntime-gpu 安装包地址
+import zipfile       # 解压：把下载的模型/组件压缩包解开
 import tkinter as tk  # Python 自带的 GUI 库(Tk)。下面所有窗口控件都是它提供的
 from tkinter import ttk, filedialog, messagebox, simpledialog
 # “from 模块 import 名字A, 名字B” 意思是：只把 A/B 直接拿进来用。
@@ -68,8 +71,9 @@ from tkinter import ttk, filedialog, messagebox, simpledialog
 #   ttk   = 带样式的“高级控件”  filedialog = 系统“选文件夹”对话框  messagebox = 弹窗提示
 import numpy as np   # np 是 numpy 的惯用别名。numpy 提供高性能数组与数学函数
 import cv2           # OpenCV。注意 cv2.imread 读进来的图 = 一个 numpy 数组
-from PIL import Image, ImageTk, ImageDraw   # Pillow 图像库：缩略图缩放；ImageTk 把图转成 Tk 能显示的；ImageDraw 用来画简笔画
+from PIL import Image, ImageTk   # Pillow 图像库：缩略图缩放；ImageTk 把图转成 Tk 能显示的
 from sklearn.cluster import DBSCAN   # 聚类算法：把“相似的人脸特征”自动归成同一个人
+import onnxruntime   # onnxruntime：用来检测本机有没有 CUDA（NVIDIA 显卡）可用
 from insightface.app import FaceAnalysis   # 现成人脸识别模型封装：检测脸+提取512维特征
 
 # ---------- 模型根目录：优先 E 盘，回退用户目录 ----------
@@ -101,6 +105,37 @@ MODEL_ROOT = next((r for r in _CANDIDATE_ROOTS
 SUPPORTED = {'.jpg', '.jpeg', '.png', '.bmp', '.webp'}
 
 # ---------------------------------------------------------------------------
+# ★ 联网下载相关（精简 exe 的关键：能下载的都不打包进 exe）：
+#   · 人脸模型：不打包，首次使用时自动联网下载到本地（insightface 官方源）；
+#   · GPU 加速组件：不打包，用户勾选 GPU 且本机没装 CUDA 时按需联网下载。
+# 没网时程序会给出明确提示，不会假装能用。
+# ---------------------------------------------------------------------------
+MODEL_DL_URL = ('https://github.com/deepinsight/insightface/releases/download/v0.7/buffalo_l.zip')
+# GPU 加速组件的下载来源：
+#   · 留空 ''（默认）= 自动从 PyPI 官方下载与 exe 同版本的 onnxruntime-gpu wheel，
+#     再下载 NVIDIA 官方的 CUDA/cuDNN 运行库（cublas / cudnn / cudart / cufft），
+#     抽出 DLL 放进 onnxruntime 目录即可启用 GPU；
+#   · 也可以填一个你自己打包好的“GPU 组件 zip”（内含全部所需 DLL），会优先用它。
+GPU_RUNTIME_URL = ''
+
+# onnxruntime 的 CUDA 运行库需要这几个 DLL 都齐全，GPU 才能用（对应 CUDA 12 / cuDNN 9）。
+# 注意：cufft 不算在这——它可能装在系统其他位置，只在下载包里补上即可。
+GPU_RUNTIME_DLLS = ('onnxruntime_providers_cuda.dll', 'cublas64_12.dll',
+                    'cublasLt64_12.dll', 'cudart64_12.dll', 'cudnn64_9.dll')
+
+
+def _nvidia_driver_present():
+    """本机有没有 NVIDIA 显卡驱动：看 System32 里有没有 nvcuda.dll（驱动自带的加载器）。"""
+    sr = os.environ.get('SystemRoot') or r'C:\Windows'
+    return os.path.exists(os.path.join(sr, 'System32', 'nvcuda.dll'))
+
+
+def _gpu_runtime_ready():
+    """CUDA 运行库 DLL 是否已经齐全（放在 onnxruntime 的 capi 目录里）。"""
+    capi = os.path.join(os.path.dirname(onnxruntime.__file__), 'capi')
+    return all(os.path.exists(os.path.join(capi, n)) for n in GPU_RUNTIME_DLLS)
+
+# ---------------------------------------------------------------------------
 # ★★★ 界面主题 —— 把“颜色”和“字体”集中定义成“命名常量”，统一样式、方便修改 ★★★
 # ---------------------------------------------------------------------------
 # 界面的“颜值”全靠下面这些变量。想改配色，只动这里几行，全界面一起变。
@@ -109,34 +144,69 @@ SUPPORTED = {'.jpg', '.jpeg', '.png', '.bmp', '.webp'}
 # 颜色用“十六进制”表示，格式是 #红红绿绿蓝蓝，每两位一个 0~255 的十六进制数：
 #   #ff0000 红  #00ff00 绿  #0000ff 蓝  #ffffff 白  #000000 黑
 # 可以用在线“取色器”自己挑喜欢的颜色，把值填进来即可。
+# 配色走“温暖回忆”路线（暖杏/奶油色），这是一直定下的主题，不能换：
+#   白奶油面板 + 温暖杏色主调，让人想起旧照片和老相册的氛围。
+# 在“温暖”基础上尽量做干净、克制，去掉花哨装饰，贴近成熟相册软件。
 C_BG          = '#faf7f2'   # 窗口/画布背景：极浅米色，比刺眼的纯白柔和
-C_BG_DEEP     = '#f5f1ed'   # 画布背景的“深一档”：让白色卡片浮在更明显的底色上
-C_PANEL       = '#fffbf8'   # 面板背景：极浅奶油色，用于顶栏、工具条、人物卡片
-C_ACCENT      = '#d4956e'   # 主色调（温暖杏色）：按钮、标题、进度条、悬停高亮都用它
-C_ACCENT_LT   = '#e0a87c'   # 主色调的“浅一档”：鼠标悬停在按钮上时用
-C_ACCENT_DK   = '#c47e54'   # 主色调的“深一档”：按钮按下那一刻用
-C_ACCENT_SOFT = '#f5ede7'   # 主色调的“极浅打底”：按钮悬停背景、小徽章底色
-C_BORDER      = '#e8ddd5'   # 卡片/输入框的“淡边框”颜色
-C_BORDER_DK   = '#d9cfc6'   # 稍深一点的边框/分隔线颜色
+C_BG_DEEP     = '#f3eee8'   # 画布背景的“深一档”：浅暖灰，让白卡片浮起来
+C_PANEL       = '#fffdf9'   # 面板/卡片底色：极浅奶油白
+C_ACCENT      = '#c98d5e'   # 主色调（温暖杏色）：按钮、标题、进度条、悬停高亮
+C_ACCENT_LT   = '#ddab80'   # 主色调的“浅一档”：鼠标悬停在按钮上时用
+C_ACCENT_DK   = '#b37445'   # 主色调的“深一档”：按钮按下那一刻用
+C_ACCENT_SOFT = '#f6ece2'   # 主色调的“极浅打底”：悬停背景、名言卡片底色
+C_BORDER      = '#e6dbd0'   # 卡片/输入框的“淡边框”颜色
+C_BORDER_DK   = '#d6c9bb'   # 稍深一点的边框/分隔线颜色
 C_TEXT        = '#5c4a40'   # 主文字颜色：温暖深棕，比纯黑更耐看
 C_TEXT_TITLE  = '#4a3830'   # 标题/大号文字：比正文更深，更有分量
 C_TEXT_SUB    = '#9b8b7e'   # 次要文字颜色：暖灰棕，用于说明、提示
 C_TEXT_DIS    = '#bfb0a6'   # 置灰文字：浅棕灰，用于禁用/占位提示
 C_OK          = '#6ba383'   # 状态灯·绿：就绪/完成
-C_RUN         = '#d4956e'   # 状态灯·橙：正在处理
+C_RUN         = '#c98d5e'   # 状态灯·橙：正在处理
 C_ERR         = '#d97a66'   # 状态灯·红：出错
 C_WARN        = '#e8a76e'   # 状态灯·琥珀：警告
-C_CARD_HOV    = '#d4956e'   # 鼠标悬停在人物卡片上时，边框变成主色调（提示“可以点”）
+C_CARD_HOV    = '#c98d5e'   # 鼠标悬停在人物卡片上时，边框变成主色调（提示“可以点”）
 # ---------------------------------------------------------------------------
 # 字体：tuple (字体名, 字号, 可选样式)。ttk 控件按这个显示文字。
-FONT      = ('Microsoft YaHei', 10)            # 默认正文：微软雅黑 10 号
-FONT_BOLD = ('Microsoft YaHei', 10, 'bold')    # 加粗：卡片标题等
-FONT_SMALL = ('Microsoft YaHei', 8)            # 小号：文件名等次要文字
+# 字号参照 VSCode：正文 13px 起，不费眼；小号说明也保持可读。
+FONT      = ('Microsoft YaHei', 13)            # 默认正文：微软雅黑 13 号
+FONT_BOLD = ('Microsoft YaHei', 13, 'bold')    # 加粗：卡片标题等
+FONT_SMALL = ('Microsoft YaHei', 11)           # 小号：文件名等次要文字
 FONT_TITLE = ('Microsoft YaHei', 22, 'bold')   # 顶栏大标题
-FONT_SUB   = ('Microsoft YaHei', 9)            # 顶栏副标题
+FONT_SUB   = ('Microsoft YaHei', 11)           # 顶栏副标题
+# 名言用的“艺术字体”：华文行楷是行书笔画的毛笔感字体，写名言很有味道。
+# 系统没有这个字体时 Tk 会自动退回默认字体，不影响运行。
+FONT_QUOTE = ('华文行楷', 20)
 
 # 网格每行放几张卡片（两个窗口共用）
 GRID_COLS = 4
+
+# 聚类等待时在状态栏下方轮播的“名言”（像游戏加载界面那样提神）
+# 主题：珍视回忆、珍视友谊。每句轮着显示，聚类结束自动消失。
+QUOTES = [
+    "真正的朋友，是即使多年不见，一开口仍是当年的人。",
+    "最好的友情，不是形影不离，而是各自忙碌，又互相牵挂。",
+    "照片会泛黄，但那些一起大笑的日子，永远闪闪发光。",
+    "所谓回忆，就是把每一个平凡的当下，活成以后想回去的时光。",
+    "友谊不是一段长久的相识，而是一段永久的铭记。",
+    "岁月可以偷走容颜，却偷不走我们共度的青春。",
+    "有些人注定是生命里的光，哪怕只照亮一瞬，也值得一生珍藏。",
+    "真正的朋友会在整个世界都将你遗忘时，仍然记得你。",
+    "回忆是时间的礼物，友情是回忆里最温暖的篇章。",
+    "不要忘了那些陪你走过风雨的人，他们是岁月里最珍贵的收藏。",
+    "友谊像一坛老酒，越久越醇，而那些回忆就是最好的酿造。",
+    "最珍贵的照片，不是拍得最好的那张，而是藏着最多回忆的那张。",
+    "时光不老，我们不散——送给每一份真挚友谊的约定。",
+    "多年以后我们或许走散在人海，但回忆会让彼此一次次重逢。",
+]
+
+# 按“人脸总数 N”分三档的内存保护阶梯（N 越多内存压力越大，保护层层叠加）：
+#   量少  N ≤ FACE_TIER_MID    只做分块计算（零精度损失，恒开）
+#   中等  FACE_TIER_MID < N ≤ FACE_TIER_HUGE
+#                            再加 float16 半精度存特征（内存减半，近无损）
+#   巨大  N > FACE_TIER_HUGE   再加“确认闸门”：先弹窗问用户，同意才继续
+FACE_TIER_MID   = 30000     # 超过它，特征改用 float16 存（每张脸 2KB→1KB）
+FACE_TIER_HUGE  = 150000    # 超过它，聚类前必须先让用户确认，防止内存爆掉
+SIM_CHUNK       = 4096      # 相似度矩阵分块的行数：分块算，省内存且结果不变
 
 
 # ============================================================================
@@ -301,7 +371,13 @@ def _reassign_to_nearest(emb, labels, centroids, min_score, qualities=None):
         return np.full(len(emb), -1, dtype=int)
     # 把所有老大排成矩阵 C：每行一个老大，和 emb 一乘就一次算出所有相似度
     C = np.stack([centroids[l] for l in lab_list])        # (群数, 512)
-    sims = emb @ C.T                                      # (脸数, 群数)
+    # ★分块算相似度：不一次生成 (脸数, 群数) 的大矩阵，按 SIM_CHUNK 行一批批算。
+    #   数学结果和一次性 @ 完全一样，只是峰值内存从“整张脸×群”降到“一块×群”。
+    n_faces = len(emb)
+    sims = np.empty((n_faces, len(lab_list)), dtype=np.float32)
+    for s in range(0, n_faces, SIM_CHUNK):
+        e = min(s + SIM_CHUNK, n_faces)
+        sims[s:e] = emb[s:e] @ C.T
     best = sims.argmax(axis=1)                            # 每张脸最像哪个老大
     best_score = sims[np.arange(len(emb)), best]          # 那个老大给的分数
 
@@ -332,7 +408,13 @@ def _merge_close_groups(emb, labels, centroids, merge_score):
     if len(lab_list) < 2:
         return labels
     C = np.stack([centroids[l] for l in lab_list])        # (群数, 512)
-    sim = C @ C.T                                         # 群与群之间的相似度矩阵
+    # ★分块算“群×群”相似度：群很多时也不一次生成 (群数, 群数) 大矩阵，
+    #   按 SIM_CHUNK 行一批批算，峰值内存从 O(群²) 降到 O(块×群)。
+    g = len(lab_list)
+    sim = np.empty((g, g), dtype=np.float32)
+    for a in range(0, g, SIM_CHUNK):
+        a2 = min(a + SIM_CHUNK, g)
+        sim[a:a2] = C[a:a2] @ C.T
     new_labels = np.array(labels)
     for a in range(len(lab_list)):
         for b in range(a + 1, len(lab_list)):
@@ -397,7 +479,12 @@ def smart_cluster(emb, eps, min_cluster, max_iters=3, qualities=None):
     """
     # 第一轮粗分：DBSCAN。因为输入已归一化，metric='cosine' 时
     # 距离 = 1 - 相似度，所以 eps 正好等于“相似度多少才算一家人”的临界。
-    cl = DBSCAN(eps=eps, min_samples=min_cluster, metric='cosine')
+    # ★内存保护：cosine 不能进 BallTree，sklearn 会退化出“全脸×全脸”的 N² 大矩阵
+    #   （10 万张脸 ≈ 40GB，直接爆内存）。对归一化向量，欧氏距离与余弦距离
+    #   单调等价：d_e = √(2·d_c)。所以换成 metric='euclidean' + eps'=√(2·eps)，
+    #   聚类结果【完全一样】，但能走 BallTree 树搜索，内存降到 O(N·logN)。
+    cl = DBSCAN(eps=np.sqrt(2.0 * eps), min_samples=min_cluster,
+                metric='euclidean', algorithm='ball_tree')
     labels = cl.fit_predict(emb)
 
     # 把距离阈值换算成相似度阈值：
@@ -437,8 +524,8 @@ class FaceAlbumGUI:
         # C++ 你在构造函数里初始化成员，这里一样。
         self.root = root                  # 保存主窗口对象，方便后续操作窗口
         root.title("本地人脸聚类相册")     # 设置窗口标题（方法调用，不用写 return）
-        root.geometry("1150x780")         # 窗口初始大小：宽x高，单位像素
-        root.minsize(900, 600)            # 窗口最小尺寸，防止被拖太小
+        root.geometry("1240x840")         # 窗口初始大小：宽x高，单位像素
+        root.minsize(980, 640)            # 窗口最小尺寸，防止被拖太小
         root.configure(bg=C_BG)           # ★美化：把整个窗口背景刷成我们的主题浅色
 
         # ------------------------------------------------------------------
@@ -449,7 +536,13 @@ class FaceAlbumGUI:
         self.input_dir = tk.StringVar()                 # 装“照片文件夹路径”的文本框内容
         self.eps = tk.DoubleVar(value=0.43)             # 聚类阈值 eps，浮点，默认 0.43
         self.min_cluster = tk.IntVar(value=2)           # 最少照片数，整数，默认 2
-        self.use_gpu = tk.BooleanVar(value=True)        # “GPU加速”勾选框，默认勾上
+        # ★ 开机探测显卡情况（不靠 get_available_providers，那只看编译选项不可靠）：
+        #   有没有 NVIDIA 驱动(nvcuda.dll) + CUDA 运行库 DLL 是否齐全。
+        #   A 卡/核显/无独显 = 没驱动 → 自动禁用 GPU 选项，全程 CPU，绝不报错。
+        self._nvidia_driver = _nvidia_driver_present()
+        self._gpu_runtime = _gpu_runtime_ready()
+        self._cuda_available = self._nvidia_driver and self._gpu_runtime
+        self.use_gpu = tk.BooleanVar(value=self._cuda_available)  # “GPU加速”勾选框：有显卡才默认勾
         self.status_text = tk.StringVar(value="就绪 —— 请选择照片文件夹")  # 底部状态栏文字
         self.export_mode = tk.StringVar(value='copy')   # 写入方式：'copy'=复制 / 'move'=移动原图
         self.app = None              # insightface 模型对象。None 表示“还没加载”
@@ -462,8 +555,13 @@ class FaceAlbumGUI:
         #                              多个线程同时读高清大图 + 并发调用模型，内存成倍叠加，
         #                              最终被系统杀掉闪退。这个开关保证“同时只有一轮”。
         self._thumb_refs = []        # 保存缩略图引用，防被垃圾回收(GC)提前清掉(见下)
-        self._watermark_imgs = []    # 背景水印所有姿势的 PhotoImage 对象（防 GC，保引用）
-        self._watermark_ids = []     # 背景水印所有贴纸在画布上的编号列表（重铺/删除要用）
+        self._empty = None           # 画布上的“空状态”占位提示（无结果时居中显示）
+        self._quote_idx = 0          # 名言轮播的下标（等待聚类时在状态栏下方滚动显示）
+        self._quote_label = None     # 名言标签控件；空闲/结束时隐藏（见 _build_ui、_cluster_finished）
+        self._quote_after_id = None  # 名言轮播定时器的编号，结束时要取消它防止残留
+        self._quote_seq = 0          # 名言动画的“世代”：每次新动画 +1，用来作废旧动画帧
+        self._confirm_event = threading.Event()   # “大量人脸确认闸门”的唤醒开关（线程间握手）
+        self._confirm_ok = False      # 用户对确认闸门的回答：True=同意继续 / False=取消
         self.msg_queue = queue.Queue()   # 线程安全队列：后台线程->界面线程传消息用
         # queue.Queue() 内部带锁，多线程往里 put / get 都不会乱，不用像 C++ 那样自己加 mutex。
 
@@ -489,33 +587,32 @@ class FaceAlbumGUI:
         style.configure('.', font=FONT,
                         background=C_BG, foreground=C_TEXT)
 
-        # --- 普通按钮：白底、淡边框、圆角感(通过 padding 内边距营造) ---
+        # --- 普通按钮：白底、淡灰边框，悬停变浅，克制不花哨 ---
         style.configure('TButton',
                         background=C_PANEL,      # 底色白色
-                        foreground=C_TEXT,       # 文字深色
-                        bordercolor=C_BORDER,    # 边框淡色
+                        foreground=C_TEXT,       # 文字近黑
+                        bordercolor=C_BORDER,    # 边框淡灰
                         borderwidth=1,
-                        padding=(14, 6),         # (左右, 上下) 内边距，让按钮显得“胖一点”
+                        padding=(16, 7),         # (左右, 上下) 内边距，够大不挤
                         focuscolor=C_ACCENT)     # 键盘焦点时的高亮色
         # style.map(样式名, 状态=颜色列表)：定义“不同状态”下的颜色。
-        #   状态是 ttk 内置的：active=鼠标悬停、pressed=按住、disabled=置灰……
-        #   这里让按钮悬停时浅一点、按下时深一点，做出“会动”的反馈。
         style.map('TButton',
-                  background=[('active', C_ACCENT_SOFT), ('pressed', '#ecd9c9')],
+                  background=[('active', C_BG), ('pressed', C_BG_DEEP)],
                   bordercolor=[('active', C_ACCENT), ('focus', C_ACCENT)])
 
-        # --- 主按钮（“开始聚类”）：主色调填充，白字，看起来像“最该点的那颗” ---
+        # --- 主按钮（“开始聚类”）：主色填充白字，整个界面唯一的重色块 ---
         style.configure('Primary.TButton',
-                        background=C_ACCENT,     # 主色调蓝紫底
+                        background=C_ACCENT,     # 主色蓝底
                         foreground='#ffffff',    # 白字
                         bordercolor=C_ACCENT,
                         borderwidth=0,           # 无边框，纯色块更现代
-                        padding=(18, 7),
+                        padding=(22, 8),
                         font=FONT_BOLD)          # 加粗，突出它是主要操作
         style.map('Primary.TButton',
                   background=[('active', C_ACCENT_LT),   # 悬停变浅
-                              ('pressed', C_ACCENT_DK)], # 按下变深
-                  foreground=[('disabled', C_TEXT_DIS)])  # 置灰时文字也变浅
+                              ('pressed', C_ACCENT_DK),  # 按下变深
+                              ('disabled', C_BORDER_DK)],  # 禁用时变灰
+                  foreground=[('disabled', '#ffffff')])
 
         # --- 输入框：白底、淡边框、聚焦时边框变主色（给人“我在编辑它”的提示） ---
         style.configure('TEntry',
@@ -524,26 +621,34 @@ class FaceAlbumGUI:
                         bordercolor=C_BORDER,
                         lightcolor=C_BORDER,        # clam 主题里边框由这俩控制
                         darkcolor=C_BORDER,
-                        padding=4)
+                        padding=5)
         style.map('TEntry',
                   bordercolor=[('focus', C_ACCENT)],   # 获得焦点 -> 边框变主色
                   lightcolor=[('focus', C_ACCENT)],
                   darkcolor=[('focus', C_ACCENT)])
 
-        # --- 勾选框：文字颜色对齐主题 ---
+        # --- 勾选框 / 单选框：文字颜色对齐主题 ---
         style.configure('TCheckbutton', background=C_PANEL, foreground=C_TEXT)
         style.map('TCheckbutton',
                   background=[('active', C_PANEL)],   # 悬停时别变色，保持白色面板
                   foreground=[('active', C_ACCENT)])  # 但文字变成主色，仍然有反馈
+        style.configure('TRadiobutton', background=C_PANEL, foreground=C_TEXT)
+        style.map('TRadiobutton',
+                  background=[('active', C_PANEL)],
+                  foreground=[('active', C_ACCENT)])
 
-        # --- 进度条：满格部分用主色调，没走到的部分用浅灰，不再是一根死板的绿条 ---
+        # --- 面板：白色圆角面板样式，承载各操作区 ---
+        style.configure('Panel.TFrame', background=C_PANEL)
+        style.configure('Panel.TLabel', background=C_PANEL, foreground=C_TEXT)
+
+        # --- 进度条：满格主色，轨道浅灰，细一点更精致 ---
         style.configure('Horizontal.TProgressbar',
                         background=C_ACCENT,          # 已填充颜色
-                        troughcolor='#ece2d6',        # 轨道(底槽)颜色
-                        bordercolor='#ece2d6',
-                        thickness=12)                 # 条的高度(像素)，粗一点更醒目
+                        troughcolor=C_BG_DEEP,        # 轨道(底槽)颜色
+                        bordercolor=C_BG_DEEP,
+                        thickness=10)                 # 条的高度(像素)
 
-        # --- 滚动条：同样换成主题色 ---
+        # --- 滚动条：浅灰滑块，和页面融为一体 ---
         style.configure('Vertical.TScrollbar',
                         background=C_BORDER_DK,       # 滑块颜色
                         troughcolor=C_BG,             # 轨道颜色
@@ -560,89 +665,96 @@ class FaceAlbumGUI:
         # 本文件只用 pack(顺序摆放) 和 grid(表格摆放)。控件先创建，再 pack/grid 到父容器。
         # 例如 ttk.Button(...).pack(...)：先造按钮，立刻 pack 到父容器并指定靠边/内边距。
         # ------------------------------------------------------------------
-        self._build_header()     # ★美化：顶部的标题横幅（单独一个方法，保持 _build_ui 清爽）
+        self._build_header()     # 顶部的标题横幅（单独一个方法，保持 _build_ui 清爽）
 
-        # 工具条：一个白色“面板”容器，把各种参数控件收在一起。
-        # style='Panel.TFrame' 是我们下面临时“注册”的一个面板样式（白底无边框）。
-        top = ttk.Frame(self.root, style='Panel.TFrame', padding=(16, 12))
-        top.pack(fill=tk.X, padx=18, pady=(0, 10))   # padx/pady 让它四周留点边，像浮起的卡片
-        # 先注册 Panel 样式（tk.Frame 不能直接用 bg 参数做圆滑主题，用 style 最干净）：
-        ttk.Style(self.root).configure('Panel.TFrame', background=C_PANEL)
+        # 工具条：一个白色面板容器，把各种参数控件收在一起
+        top = ttk.Frame(self.root, style='Panel.TFrame', padding=(18, 14))
+        top.pack(fill=tk.X, padx=16, pady=(0, 10))   # padx/pady 让它四周留点边，像浮起的卡片
 
-        # 第一行：文件夹选择 + 开始按钮
+        # 第一行：文件夹选择（左） + 开始聚类（右，主操作）
         row1 = ttk.Frame(top, style='Panel.TFrame')
-        row1.pack(fill=tk.X, pady=(0, 6))
-        # Label(textvariable=...)：文字和变量绑定，变量变文字就跟着变（这里用来显示“照片文件夹:”）
-        ttk.Label(row1, text="📁 照片文件夹:", style='Panel.TLabel').pack(side=tk.LEFT)
+        row1.pack(fill=tk.X, pady=(0, 10))
+        ttk.Label(row1, text="照片文件夹", style='Panel.TLabel').pack(side=tk.LEFT)
         # Entry = 单行输入框。textvariable 绑定到 self.input_dir，双向同步
-        ttk.Entry(row1, textvariable=self.input_dir, width=42).pack(side=tk.LEFT, padx=6)
-        # Button 的 command 参数 = 按钮被点击时要调用的“函数”。这里传方法名不传括号
-        # (传 self._choose_dir 而不是 self._choose_dir())：
-        #   传括号 = “立刻调用一次”并把返回值给 Tk；不传括号 = 把函数本身交给 Tk 以后点。
-        #   这正体现 Python“函数是一等公民，可当值传递”，类似 C++ 函数指针却更自然。
-        ttk.Button(row1, text="浏览...", command=self._choose_dir).pack(side=tk.LEFT)
-        # 按钮存到 self._start_btn：聚类进行中要能把它禁用(置灰)，防止重复点击叠加后台线程
-        # style='Primary.TButton' 让它用上面定义的主色样式，成为整行最显眼的按钮。
-        self._start_btn = ttk.Button(row1, text="开始聚类 ▶", style='Primary.TButton',
+        ttk.Entry(row1, textvariable=self.input_dir, width=46).pack(side=tk.LEFT, padx=8)
+        ttk.Button(row1, text="浏览", command=self._choose_dir).pack(side=tk.LEFT)
+        # 主按钮放右侧：现代应用的习惯是“主要操作靠右”，一眼能看到
+        self._start_btn = ttk.Button(row1, text="开始聚类", style='Primary.TButton',
                                      command=self._start_cluster)
-        self._start_btn.pack(side=tk.LEFT, padx=10)
+        self._start_btn.pack(side=tk.RIGHT)
 
-        # 一个纵向分隔线，把“文件夹区”和“参数区”视觉上分开，界面更清爽。
-        ttk.Separator(row1, orient=tk.VERTICAL).pack(side=tk.LEFT, fill=tk.Y, padx=8, pady=2)
-
-        ttk.Label(row1, text="eps 阈值:", style='Panel.TLabel').pack(side=tk.LEFT, padx=(4, 2))
-        ttk.Entry(row1, textvariable=self.eps, width=5).pack(side=tk.LEFT)      # 阈值输入框(短)
-        ttk.Label(row1, text="最少张数:", style='Panel.TLabel').pack(side=tk.LEFT, padx=(8, 2))
-        ttk.Entry(row1, textvariable=self.min_cluster, width=4).pack(side=tk.LEFT)  # 张数输入框
-        # Checkbutton = 勾选框。variable 绑到 BooleanVar，勾没勾都记在 use_gpu 里
-        # 注意：这里故意用 tk.Checkbutton（经典样式）而不是 ttk.Checkbutton——
-        # ttk 的 clam 主题在部分 Windows 上勾选符号会渲染成“叉”，看不清是勾还是没勾，
-        # 换成 tk 原生勾选框后，打勾就显示标准对勾 ✓，一目了然。
-        tk.Checkbutton(row1, text="⚡ GPU 加速", variable=self.use_gpu,
-                       bg=C_PANEL, fg=C_TEXT, activebackground=C_PANEL,
-                       activeforeground=C_TEXT, selectcolor=C_PANEL,
-                       font=FONT).pack(side=tk.LEFT, padx=10)
-
-        # ★美化：右侧放一个“帮助”小按钮，新手点它就能看到参数说明（见 _show_help）
-        ttk.Button(row1, text="?", width=3,
+        # 第二行：左边参数设置，中间分隔线，右边导出设置，最右帮助按钮
+        row2 = ttk.Frame(top, style='Panel.TFrame')
+        row2.pack(fill=tk.X)
+        # -- 参数组 --
+        g1 = ttk.Frame(row2, style='Panel.TFrame')
+        g1.pack(side=tk.LEFT)
+        ttk.Label(g1, text="参数", style='Panel.TLabel', font=FONT_SMALL,
+                  foreground=C_TEXT_SUB).pack(side=tk.LEFT, padx=(0, 4))
+        ttk.Label(g1, text="eps 阈值", style='Panel.TLabel').pack(side=tk.LEFT)
+        ttk.Entry(g1, textvariable=self.eps, width=5).pack(side=tk.LEFT, padx=(4, 0))
+        ttk.Label(g1, text="最少张数", style='Panel.TLabel').pack(side=tk.LEFT, padx=(10, 0))
+        ttk.Entry(g1, textvariable=self.min_cluster, width=4).pack(side=tk.LEFT, padx=(4, 0))
+        # Checkbutton = 勾选框。用 tk 原生控件，勾选显示标准对勾 ✓，一目了然。
+        # 三种情况给出不同提示：能用 / 有 NVIDIA 但缺运行库（可联网下载）/ 没有 NVIDIA。
+        self._gpu_check = tk.Checkbutton(g1, text="GPU 加速", variable=self.use_gpu,
+                                         bg=C_PANEL, fg=C_TEXT, activebackground=C_PANEL,
+                                         activeforeground=C_TEXT, selectcolor=C_PANEL,
+                                         font=FONT)
+        if self._cuda_available:
+            pass
+        elif self._nvidia_driver:
+            self._gpu_check.config(fg=C_TEXT_SUB, text="GPU 加速（需联网下载运行库）")
+        else:
+            self._gpu_check.config(fg=C_TEXT_SUB, text="GPU 加速（本机无 NVIDIA 显卡）")
+        self._gpu_check.pack(side=tk.LEFT, padx=(10, 0))
+        # -- 分隔线 --
+        ttk.Separator(row2, orient=tk.VERTICAL).pack(side=tk.LEFT, fill=tk.Y, padx=14, pady=2)
+        # -- 导出组 --
+        g2 = ttk.Frame(row2, style='Panel.TFrame')
+        g2.pack(side=tk.LEFT)
+        ttk.Label(g2, text="导出", style='Panel.TLabel', font=FONT_SMALL,
+                  foreground=C_TEXT_SUB).pack(side=tk.LEFT, padx=(0, 4))
+        ttk.Radiobutton(g2, text="复制", value='copy',
+                        variable=self.export_mode).pack(side=tk.LEFT)
+        ttk.Radiobutton(g2, text="移动原图", value='move',
+                        variable=self.export_mode).pack(side=tk.LEFT, padx=(0, 8))
+        self._export_btn = ttk.Button(g2, text="导出相册", command=self._export_album)
+        self._export_btn.pack(side=tk.LEFT)
+        ttk.Label(g2, text="未命名的人物将导出为“人物N”", style='Panel.TLabel',
+                  font=FONT_SMALL, foreground=C_TEXT_SUB).pack(side=tk.LEFT, padx=(8, 0))
+        # -- 帮助按钮，最右侧 --
+        ttk.Button(row2, text="?", width=3,
                    command=self._show_help).pack(side=tk.RIGHT)
 
-        # 第三行：导出相册设置——是否写入硬盘、复制还是移动原图、一键导出
-        row3 = ttk.Frame(top, style='Panel.TFrame')
-        row3.pack(fill=tk.X, pady=(6, 0))
-        ttk.Label(row3, text="📂 写入相册:", style='Panel.TLabel').pack(side=tk.LEFT)
-        # 两种写入方式二选一：复制一份（原图不动）或 移动原图（原文件夹里就没有了）
-        ttk.Radiobutton(row3, text="复制", value='copy',
-                        variable=self.export_mode).pack(side=tk.LEFT, padx=(4, 2))
-        ttk.Radiobutton(row3, text="移动原图", value='move',
-                        variable=self.export_mode).pack(side=tk.LEFT, padx=(0, 8))
-        # 导出按钮：点击后选输出文件夹，按人物名字建子文件夹，把照片写进去
-        self._export_btn = ttk.Button(row3, text="导出相册 ▶", command=self._export_album)
-        self._export_btn.pack(side=tk.LEFT, padx=(4, 6))
-        # 一行小字提醒：没起名字的人物会按“人物N”导出
-        ttk.Label(row3, text="（给人物起好名字，子文件夹就用名字；没起名的用“人物N”）",
+        # 一行小字提示：点击卡片可查看该人物全部照片，弱化显示不抢戏
+        ttk.Label(top, text="提示：点击人物卡片可查看该人物的全部照片；点击照片可用系统默认程序打开原图。",
                   style='Panel.TLabel', font=FONT_SMALL,
-                  foreground=C_TEXT_SUB).pack(side=tk.LEFT)
-
-        # 第二行：一行小字提示“点击卡片可查看该人物全部照片”，弱化显示不抢戏
-        ttk.Label(top, text="💡 提示：聚类完成后，点击任意人物卡片可查看该人物的全部照片；"
-                            "点击照片可用系统默认程序打开原图。",
-                  style='Panel.TLabel', font=FONT_SMALL,
-                  foreground=C_TEXT_SUB).pack(fill=tk.X)
+                  foreground=C_TEXT_SUB).pack(fill=tk.X, pady=(8, 0))
 
         # 状态栏(一行文字)+进度条。anchor=tk.W 文字左对齐；progress 是横条进度条
-        # ★美化：状态栏也放进一个白色圆角面板里，视觉上更整。
-        status_panel = ttk.Frame(self.root, style='Panel.TFrame', padding=(16, 10))
-        status_panel.pack(fill=tk.X, padx=18, pady=(0, 10))
+        status_panel = ttk.Frame(self.root, style='Panel.TFrame', padding=(18, 12))
+        status_panel.pack(fill=tk.X, padx=16, pady=(0, 10))
         ttk.Label(status_panel, textvariable=self.status_text, anchor=tk.W,
                   style='Panel.TLabel', foreground=C_TEXT).pack(fill=tk.X)
         self.progress = ttk.Progressbar(status_panel, mode='determinate')
         # mode='determinate'：进度条有一个确定的最大值和当前值，用来显示 n/m
         self.progress.pack(fill=tk.X, pady=(8, 0))
 
+        # ★名言：等待聚类时像游戏加载界面那样在进度条下方轮播一句名言。
+        #   淡蓝色底 + 楷体居中，做成一张克制的名言卡片，贴合干净主题。
+        #   平时不 pack（隐藏）；_next_quote 显示它，_cluster_finished 再收回去。
+        self._quote_box = tk.Frame(status_panel, bg=C_ACCENT_SOFT)   # 淡蓝底板
+        self._quote_label = tk.Label(self._quote_box, text="", bg=C_ACCENT_SOFT,
+                                     fg=C_ACCENT_DK, font=FONT_QUOTE,
+                                     anchor=tk.CENTER, justify=tk.CENTER,
+                                     wraplength=920)
+        # wraplength：名言太长时自动换行，不至于把窗口撑爆
+        self._quote_label.pack(fill=tk.X, padx=16, pady=8)
+
         # 主区域：可滚动画布。Canvas 是 Tk 里能“放东西还能滚动”的画布
         container = ttk.Frame(self.root)                     # 一个占满剩余空间的容器
-        container.pack(fill=tk.BOTH, expand=True, padx=16, pady=(0, 14))
+        container.pack(fill=tk.BOTH, expand=True, padx=16, pady=(0, 16))
         # fill=BOTH + expand=True = 让容器随窗口拉伸时自动变大，铺满剩余空间
         self.canvas = tk.Canvas(container, bg=C_BG, highlightthickness=0)
         # bg=C_BG：用我们定义的主题浅色背景，和窗口融为一体
@@ -652,12 +764,8 @@ class FaceAlbumGUI:
         vsb.pack(side=tk.RIGHT, fill=tk.Y)                   # 滚动条放最右边，纵向铺满
         self.canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)   # 画布占剩余
 
-        # 真正承载内容的是一个普通 Frame，把它“嵌”进画布：
-        # ★美化：给内容区设置透明背景(不指定 bg 时 ttk.Frame 会用全局 C_BG)，卡片铺在上面
+        # 真正承载内容的是一个普通 Frame，把它“嵌”进画布
         self.grid_frame = ttk.Frame(self.canvas)
-        # ★美化：先铺一层“萌妹水印”当底（bg.png），免得聚类时/没结果时窗口大片空白光秃秃。
-        #   注意顺序：水印 image 先创建、后创建的 grid_frame 窗口盖在上面，不会挡住卡片。
-        self._draw_watermark()
         # 记录 canvas 里嵌 grid_frame 的窗口编号，方便下面让它跟着画布一起变宽
         self._grid_window = self.canvas.create_window((0, 0), window=self.grid_frame, anchor='nw')
         # 画布一变宽，grid_frame 也跟着撑满整个宽度，卡片才不会只挤在左边
@@ -669,168 +777,51 @@ class FaceAlbumGUI:
         #   这行等价于定义 def _f(e): self.canvas.configure(...) 然后把 _f 传进去。
         #   bbox("all") = 算出所有子控件包住的矩形范围，scrollregion=它 即“该滚多远”。
 
+        # ★空状态：还没有聚类结果时，画布中央显示一句引导，避免大片空白。
+        #   用 place(relx/rely) 定位，窗口尺寸变了也会自动保持居中。
+        self._empty = tk.Frame(self.canvas, bg=C_BG)
+        tk.Label(self._empty, text="还没有聚类结果", bg=C_BG, fg=C_TEXT_SUB,
+                 font=('Microsoft YaHei', 17, 'bold')).pack(pady=(0, 10))
+        tk.Label(self._empty, text="选择照片文件夹，点击「开始聚类」\n"
+                                   "程序会自动识别照片里的人脸，并按人物智能分组",
+                 bg=C_BG, fg=C_TEXT_DIS, justify=tk.CENTER, font=FONT).pack()
+        self._empty.place(relx=0.5, rely=0.42, anchor='center')
+
         # 鼠标滚轮滚动（Windows 下滚轮的 delta 以 120 为单位，除以120得到“几格”）
         self.canvas.bind_all("<MouseWheel>",
                              lambda e: self.canvas.yview_scroll(int(-1 * (e.delta / 120)), "units"))
         # bind_all = 给“所有控件”绑事件；int(-1*delta/120)：向上滚是正数，翻转成向上翻页
 
-    # ---------------- ★美化：背景水印（透明线条动漫少女，平铺） ----------------
-    def _make_sticker(self, pose=0, size=200):
-        """画一个透明背景的“线条动漫少女”全身小人，用作很淡的水印。
-
-        风格：日本动漫少女风、Q 版大头的全身像，只勾线不填色，
-        线条用很淡的灰紫色，透明度也压得很低——就像人民币上的水印，
-        若有若无，不抢画面内容。
-
-        pose 参数决定手臂姿势（0=举双手欢呼 / 1=挥手 / 2=叉腰 / 3=双手身前），
-        这样平铺时每个小人动作不一样，更生动可爱。
-        """
-        im = Image.new('RGBA', (size, size), (0, 0, 0, 0))   # 全透明底
-        d = ImageDraw.Draw(im)
-        ink = (110, 105, 125, 55)      # 水印线条色：灰紫 + 低透明度
-        L = 3                          # 主线条宽
-        s = size / 200.0               # 按目标尺寸整体缩放
-        cx = size // 2                 # 画布水平中线
-
-        # ---------- 头 ----------
-        hr = 42 * s                    # 头半径（Q版大头）
-        hy = 64 * s                    # 头心 y 坐标
-        d.ellipse([cx - hr * 1.15, hy - hr * 1.15,      # 头发大圆（比脸大一圈）
-                   cx + hr * 1.15, hy + hr * 0.85], outline=ink, width=L)
-        d.arc([cx - 9 * s, hy - hr * 1.7, cx + 9 * s, hy - hr * 0.9],   # 呆毛
-              200, 340, fill=ink, width=2)
-        d.ellipse([cx - hr, hy - hr, cx + hr, hy + hr], outline=ink, width=L)   # 脸
-        for dx in (-hr * 0.5, 0, hr * 0.5):              # 刘海三道弧
-            d.arc([cx + dx - hr * 0.3, hy - hr * 0.75,
-                   cx + dx + hr * 0.3, hy - hr * 0.15], 180, 360, fill=ink, width=2)
-        for dx in (-hr * 0.35, hr * 0.35):               # 眯眼笑（^^）
-            d.arc([cx + dx - hr * 0.18, hy - hr * 0.05,
-                   cx + dx + hr * 0.18, hy + hr * 0.18], 20, 160, fill=ink, width=2)
-        d.arc([cx - hr * 0.15, hy + hr * 0.2, cx + hr * 0.15, hy + hr * 0.4],   # 嘴
-              20, 160, fill=ink, width=2)
-        for dx in (-hr * 0.7, hr * 0.7):                 # 腮红小圈（更淡）
-            d.ellipse([cx + dx - hr * 0.1, hy + hr * 0.08,
-                       cx + dx + hr * 0.1, hy + hr * 0.28],
-                      outline=(110, 105, 125, 35), width=2)
-
-        # ---------- 身体：连衣裙剪影（梯形） ----------
-        top = hy + hr * 0.9            # 肩线 y
-        bot = size - 26 * s            # 裙摆 y
-        waist = hy + hr * 1.7          # 腰线 y
-        d.line([(cx - 26 * s, top), (cx - 40 * s, bot)], fill=ink, width=L)   # 左裙边
-        d.line([(cx + 26 * s, top), (cx + 40 * s, bot)], fill=ink, width=L)   # 右裙边
-        d.line([(cx - 40 * s, bot), (cx + 40 * s, bot)], fill=ink, width=L)   # 裙摆边
-        d.line([(cx - 20 * s, top), (cx, top + 14 * s)], fill=ink, width=2)   # 领口 V 左
-        d.line([(cx + 20 * s, top), (cx, top + 14 * s)], fill=ink, width=2)   # 领口 V 右
-        d.line([(cx - 22 * s, waist), (cx + 22 * s, waist)], fill=ink, width=2)   # 腰线
-
-        # ---------- 手臂（按姿势变化，这是让小人动作不同的关键） ----------
-        sh_l, sh_r = (cx - 26 * s, top), (cx + 26 * s, top)   # 左右肩点
-        if pose == 0:        # 举双手欢呼
-            d.line([sh_l, (cx - 30 * s, top - 26 * s), (cx - 14 * s, top - 30 * s)], fill=ink, width=L)
-            d.line([sh_r, (cx + 30 * s, top - 26 * s), (cx + 14 * s, top - 30 * s)], fill=ink, width=L)
-        elif pose == 1:      # 挥手（右臂举起，左臂垂放）
-            d.line([sh_l, (cx - 36 * s, top + 8 * s)], fill=ink, width=L)
-            d.line([sh_r, (cx + 32 * s, top - 22 * s), (cx + 20 * s, top - 26 * s)], fill=ink, width=L)
-        elif pose == 2:      # 叉腰
-            d.line([sh_l, (cx - 34 * s, top + 14 * s)], fill=ink, width=L)
-            d.line([sh_r, (cx + 34 * s, top + 14 * s)], fill=ink, width=L)
-        else:                # 双手放身前（害羞）
-            d.line([sh_l, (cx - 14 * s, waist)], fill=ink, width=L)
-            d.line([sh_r, (cx + 14 * s, waist)], fill=ink, width=L)
-
-        # ---------- 腿 ----------
-        d.line([(cx - 18 * s, bot - 4 * s), (cx - 16 * s, size - 10 * s)], fill=ink, width=L)
-        d.line([(cx + 18 * s, bot - 4 * s), (cx + 16 * s, size - 10 * s)], fill=ink, width=L)
-        for dx in (-16 * s, 16 * s):                       # 小鞋底
-            d.line([(cx + dx - 6 * s, size - 10 * s), (cx + dx + 6 * s, size - 10 * s)], fill=ink, width=2)
-        return im
-
-    def _draw_watermark(self):
-        """把自绘的透明线条少女平铺到画布背景，让窗口空白处不单调。
-
-        做法：
-          - 生成 4 种不同姿势的小人（透明底、纯线条、很淡）；
-          - 按网格平铺，相邻贴不同姿势，动作错开更可爱；
-          - 窗口大小变化时自动重铺，始终贴合窗口。
-        注意事项：水印 image 先画、后创建的卡片窗口盖在上面，不会挡住内容。
-        """
-        try:
-            # 4 种姿势各画一张，轮流铺，小人动作不一样
-            self._watermark_imgs = [
-                ImageTk.PhotoImage(self._make_sticker(pose=i)) for i in range(4)
-            ]
-            # 窗口尺寸变化时的重铺动作交给 _on_canvas_resize 统一处理
-            self._layout_watermark()
-        except Exception:
-            self._watermark_imgs = []       # 任何失败都安静跳过，不让程序报错崩掉
-
-    def _layout_watermark(self):
-        """把 4 种姿势的水印小人按网格铺满画布（交替出现，带空隙）。"""
-        try:
-            # 先删掉上一次铺的所有贴纸（避免窗口一变就叠一堆）
-            if self._watermark_ids:
-                self.canvas.delete(*self._watermark_ids)
-                self._watermark_ids = []
-            if not self._watermark_imgs:
-                return
-            w = self.canvas.winfo_width() or 1      # 画布当前宽（还没布局时取不到就先用1）
-            h = self.canvas.winfo_height() or 1     # 画布当前高
-            step = 200 + 50                         # 小人 200 宽 + 50 间距，留呼吸空间
-            ids = []
-            y = 15
-            i = 0
-            while y < h - 30:
-                x = 15
-                while x < w - 30:
-                    img = self._watermark_imgs[i % len(self._watermark_imgs)]   # 轮换姿势
-                    ids.append(self.canvas.create_image(x, y, image=img, anchor='nw'))
-                    i += 1
-                    x += step
-                y += step
-            self._watermark_ids = ids              # 记住这次铺的所有 id，下次好清理
-        except Exception:
-            pass
-
     def _on_canvas_resize(self, event):
-        """画布大小变化时统一处理：让卡片区跟着撑满宽度 + 重铺水印。
+        """画布大小变化时统一处理：让卡片区跟着撑满宽度。
 
         用 after_idle 把多次连续触发合并成一次，避免拖动窗口时疯狂重算。
         """
         self.root.after_idle(self._apply_canvas_layout)
 
     def _apply_canvas_layout(self):
-        """真正执行布局：卡片区撑满画布宽度，水印重新铺一遍。"""
+        """真正执行布局：卡片区撑满画布宽度（卡片才不会只挤在左半边）。"""
         try:
             w = self.canvas.winfo_width()
-            # 1) grid_frame 撑满画布宽度（卡片才不会只挤在左半边）
             if self._grid_window is not None and w > 1:
                 self.canvas.itemconfigure(self._grid_window, width=w)
-            # 2) 水印跟着新尺寸重铺
-            self._layout_watermark()
         except Exception:
             pass
 
-    # ---------------- ★美化：顶栏标题横幅 ----------------
+    # ---------------- ★顶栏标题横幅 ----------------
     def _build_header(self):
         """顶部横幅：应用名称 + 一句话副标题，给界面一个‘门面’。"""
-        # 用普通 tk.Frame（可以设 bg），白色底、底部一条主色调细线，视觉上“压住”整个界面。
+        # 用普通 tk.Frame（可以设 bg），白底 + 一条主色调细线顶边，干净克制。
         header = tk.Frame(self.root, bg=C_PANEL)
         header.pack(fill=tk.X, pady=(0, 10))
-        # tk.Frame(bg=...) 直接用颜色常量，ttk.Frame 则要通过 style —— 这里用 tk.Frame 更省事。
-        tk.Frame(header, bg=C_ACCENT, height=3).pack(fill=tk.X)
-        # 上面这个窄窄的 Frame 就是那条主色调的“顶边”，高 3 像素，纯装饰。
+        tk.Frame(header, bg=C_ACCENT, height=3).pack(fill=tk.X)   # 顶部 3px 主色细线
 
         title_row = tk.Frame(header, bg=C_PANEL)
-        title_row.pack(fill=tk.X, padx=20, pady=(10, 4))
-        tk.Label(title_row, text="本地人脸聚类相册", bg=C_PANEL,
-                 fg=C_ACCENT, font=FONT_TITLE).pack(side=tk.LEFT)
-        # Label 的文字颜色 fg、背景 bg 都可以直接指定，配合我们的主题色。
-        tk.Label(title_row, text="  · 自动识别照片里的人，按人物智能分组", bg=C_PANEL,
-                 fg=C_TEXT_SUB, font=FONT_SUB).pack(side=tk.LEFT, padx=(10, 0), pady=(6, 0))
-        # ★ 欢迎词移到顶栏最右侧：楷书、加大加粗，一眼就能看到
-        tk.Label(title_row, text="欢迎使用 ♪", bg=C_PANEL,
-                 fg=C_ACCENT, font=('楷体', 18, 'bold')).pack(side=tk.RIGHT, pady=(4, 0))
+        title_row.pack(fill=tk.X, padx=22, pady=(12, 6))
+        tk.Label(title_row, text="人脸聚类相册", bg=C_PANEL,
+                 fg=C_TEXT_TITLE, font=FONT_TITLE).pack(side=tk.LEFT)
+        tk.Label(title_row, text="自动识别照片里的人，按人物智能分组", bg=C_PANEL,
+                 fg=C_TEXT_SUB, font=FONT_SUB).pack(side=tk.LEFT, padx=(12, 0), pady=(8, 0))
 
     # ---------------- 交互 ----------------
     def _choose_dir(self):
@@ -841,11 +832,24 @@ class FaceAlbumGUI:
             self.input_dir.set(d)   # 把选到的路径写进输入框（界面随之显示）
 
     def _show_help(self):
-        """★美化新增：弹出帮助窗口，向新手解释两个参数的含义。"""
-        # messagebox.showinfo(标题, 内容)：弹一个带“确定”的信息框。
-        # 三个引号把多行字符串写得更整齐，比 \n 一个个拼好看。
+        """弹出帮助窗口：先介绍软件功能，再解释参数含义。"""
         messagebox.showinfo(
-            "参数说明",
+            "功能与参数说明",
+            "关于本软件\n"
+            "    人脸聚类相册会扫描你选择的照片文件夹，自动识别照片里的人脸，\n"
+            "    把“同一人”的照片归到一组，就像手机相册的人物分组。\n"
+            "    照片在本机处理、不会上传，隐私安全。\n\n"
+            "首次使用\n"
+            "    需要联网下载人脸识别模型（约 300MB，只下载一次）；\n"
+            "    若当前无网络会给出提示，联网后重试即可。\n\n"
+            "主要功能\n"
+            "    · 人脸识别：自动检测并提取每张脸的特征；\n"
+            "    · 自动分组：同一人物自动聚成一组，不用一张张翻；\n"
+            "    · 查看详情：点击人物卡片，即可查看该人物的全部照片；\n"
+            "    · 命名人物：给人物起名字，导出时自动建同名文件夹；\n"
+            "    · 一键导出：把分组好的照片按人物复制/移动到新文件夹归档。\n\n"
+            "──────────\n"
+            "参数说明\n"
             "eps 阈值（当前默认 0.43）\n"
             "    判断两张脸有多‘像’的敏感度。值越小越严格，越难把照片分到一组；\n"
             "    值越大越宽松，容易把不同的人误并到一起。照片拍得模糊/角度多变时，\n"
@@ -855,8 +859,10 @@ class FaceAlbumGUI:
             "    设为 2 表示只出现过 1 次的独照会被归入“未分类”，避免杂七杂八的\n"
             "    路人脸也占一个格子。\n\n"
             "GPU 加速\n"
-            "    勾选后优先用显卡（NVIDIA）跑人脸模型，速度快很多；\n"
-            "    没有可用显卡时程序会自动退回 CPU。\n\n"
+            "    本机有 NVIDIA 显卡且运行库齐全时会自动启用，速度明显更快；\n"
+            "    若驱动在但运行库没装，勾选后程序会自动联网下载加速组件（约 1.2GB，\n"
+            "    只下一次）；没有 NVIDIA 显卡（A 卡/核显）或下载失败时，程序自动\n"
+            "    改用 CPU 运行，功能完全一样。\n\n"
             "小科普：聚类其实分三步走\n"
             "    ① 先用 eps 粗分一次；② 每堆算一张‘平均脸’当老大，每张照片\n"
             "    重新认老大（不像的就踢出去）；③ 两个老大长得太像（比如同一个人\n"
@@ -884,9 +890,14 @@ class FaceAlbumGUI:
         self._thumb_refs.clear()      # 引用也清空（旧缩略图随之被 GC 回收）
         self.groups = []              # 结果清空
         self.progress['value'] = 0    # 进度条归零
+        self._hide_empty()            # 收起“还没有聚类结果”的占位提示
         self._busy = True             # 标记“正在跑”，同时禁用按钮防重复点击
         self._start_btn.config(state='disabled')
         self.status_text.set("正在加载模型...")   # 状态栏提示
+
+        # ★名言：等 0.6 秒再开始轮播（避开“正在加载模型”抢镜）。之后每 4 秒换一句，
+        #   聚类结束（_cluster_finished）会自动停掉并隐藏。
+        self.root.after(600, self._show_quote)
 
         # ★ 启动后台线程。target=要在线程里运行的函数，args=(…) 是传给它的参数(元组)。
         # daemon=True：主程序退出时这个线程自动结束(不必手动 join)，防止卡住关不掉。
@@ -899,6 +910,240 @@ class FaceAlbumGUI:
         # 这个方法只在 UI 主线程里被 _poll_queue 调用，所以没有多线程写变量的风险。
         self._busy = False
         self._start_btn.config(state='normal')   # 按钮恢复可点，允许跑下一轮(新的阈值)
+
+        # ★名言：取消还没响的定时器，并“淡出”收起名言卡片，回到干净状态
+        if self._quote_after_id is not None:
+            self.root.after_cancel(self._quote_after_id)
+            self._quote_after_id = None
+        self._quote_seq += 1                     # 作废掉可能还在半路的切句动画
+        if self._quote_box.winfo_manager():      # 卡片还显示着？先淡出再藏
+            self._fade_box(False, on_done=lambda: (
+                self._quote_label.config(text=""), self._quote_box.pack_forget()))
+        else:                                    # 卡片本来就没显示，直接复位
+            self._quote_label.config(text="")
+            self._quote_box.pack_forget()
+
+    # ------------------------------------------------------------------
+    # ★名言动画：淡入/淡出卡片、轮播换句（都做成渐变，不硬切）
+    # ------------------------------------------------------------------
+    def _mix_color(self, c1, c2, t):
+        """两个 #rrggbb 颜色按比例 t(0~1) 插值，得到中间色。用来做渐变动画。"""
+        r1, g1, b1 = int(c1[1:3], 16), int(c1[3:5], 16), int(c1[5:7], 16)
+        r2, g2, b2 = int(c2[1:3], 16), int(c2[3:5], 16), int(c2[5:7], 16)
+        return f'#{round(r1 + (r2 - r1) * t):02x}' \
+               f'{round(g1 + (g2 - g1) * t):02x}' \
+               f'{round(b1 + (b2 - b1) * t):02x}'
+
+    def _fade_box(self, forward, on_done):
+        """把名言卡片从“看不见”渐变到“看得见”(forward=True) 或反向淡出。
+
+        同时渐变：卡片底板颜色(C_PANEL↔C_ACCENT_SOFT)和文字颜色(C_PANEL↔C_ACCENT_DK)。
+        文字藏色用 C_PANEL：淡到极致时文字就像“溶解”进白面板，不突兀。
+        动画期间若 _quote_seq 变了（新一轮操作），就立刻停手，避免冲突。
+        """
+        seq = self._quote_seq            # 记录本段动画的“世代”
+        steps, delay = 10, 20            # 10 帧 x 20ms = 200ms 一段渐变
+        bg0, bg1 = (C_PANEL, C_ACCENT_SOFT) if forward else (C_ACCENT_SOFT, C_PANEL)
+        fg0, fg1 = (C_PANEL, C_ACCENT_DK) if forward else (C_ACCENT_DK, C_PANEL)
+
+        def step(i):
+            if seq != self._quote_seq:   # 中途来了新动画，旧帧直接作废
+                return
+            t = i / steps
+            c = self._mix_color(bg0, bg1, t)   # 底板色
+            self._quote_box.config(bg=c)
+            self._quote_label.config(bg=c, fg=self._mix_color(fg0, fg1, t))
+            if i < steps:
+                self.root.after(delay, lambda: step(i + 1))
+            else:
+                on_done()                # 渐变动画走完，交给回调继续
+
+        step(0)
+
+    def _show_quote(self):
+        """聚类开始：把第一句名言淡入显示（卡片从进度条下方“长”出来）。"""
+        if not self._busy:               # 窗口被关了/已结束，就不折腾了
+            return
+        self._quote_seq += 1
+        q = QUOTES[self._quote_idx % len(QUOTES)]
+        self._quote_idx += 1
+        self._quote_label.config(text=f"❝ {q} ❞")
+        self._quote_box.pack(fill=tk.X, pady=(8, 0))   # 插到进度条正下方
+        self._fade_box(True, on_done=self._schedule_next_quote)
+
+    def _schedule_next_quote(self):
+        """当前这句名言显示满 4 秒后，轮到下一句。"""
+        if not self._busy:
+            return
+        self._quote_after_id = self.root.after(4000, self._next_quote)
+
+    def _next_quote(self):
+        """轮播换句：先淡出旧句，换上新句文字，再淡入。全程不硬切。"""
+        self._quote_after_id = None
+        if not self._busy:               # 已结束/被取消？不再继续轮播
+            return
+        q = QUOTES[self._quote_idx % len(QUOTES)]   # % 取余实现“轮着转”，转完从头再来
+        self._quote_idx += 1
+        self._fade_box(False, on_done=lambda: self._fade_in_new(q))
+
+    def _fade_in_new(self, q):
+        """新名言淡入（承接 _next_quote 的淡出）。"""
+        if not self._busy:
+            return
+        self._quote_seq += 1
+        self._quote_label.config(text=f"❝ {q} ❞")
+        self._fade_box(True, on_done=self._schedule_next_quote)
+
+    # ---------------- 联网下载（精简 exe 的关键） ----------------
+    def _stream_download(self, url, dest, label):
+        """把 url 流式下载到 dest 文件，百分比进度通过消息队列回报。
+
+        下载过程抛出的异常交给调用方处理（网络断了、文件不存在等都会抛）。
+        """
+        req = urllib.request.Request(url, headers={'User-Agent': 'Mozilla/5.0'})
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            total = int(resp.headers.get('Content-Length') or 0)   # 总字节数（可能没有）
+            done = 0
+            last_pct = -1
+            with open(dest, 'wb') as f:
+                while True:
+                    chunk = resp.read(256 * 1024)      # 每次读 256KB，边下边写
+                    if not chunk:
+                        break
+                    f.write(chunk)
+                    done += len(chunk)
+                    if total:                          # 有总长度才算得出百分比
+                        pct = min(100, int(done * 100 / total))
+                        if pct != last_pct:            # 只在百分比变化时才上报，少刷队列
+                            last_pct = pct
+                            self.msg_queue.put(('progress', (done, total, f"{label} {pct}%")))
+
+    def _ensure_model_ready(self):
+        """确保人脸识别模型已下载到本地。已就绪→True；需要时联网下载，成功→True，失败→False。
+
+        模型不打包进 exe：第一次使用时从这里联网下载（insightface 官方源），
+        下载到程序同目录 / 用户目录下的 .insightface，之后一直复用。
+        """
+        model_dir = os.path.join(MODEL_ROOT, 'models', 'buffalo_l')
+        try:
+            # 已有完整的模型（目录里至少一个 .onnx）就直接用
+            if os.path.isdir(model_dir) and any(f.endswith('.onnx') for f in os.listdir(model_dir)):
+                return True
+            os.makedirs(model_dir, exist_ok=True)
+            zip_path = os.path.join(os.path.dirname(model_dir), 'buffalo_l.zip')
+            self.msg_queue.put(('status', "首次使用，正在联网下载人脸识别模型（约 300MB）..."))
+            self._stream_download(MODEL_DL_URL, zip_path, "正在下载人脸识别模型")
+            # 解压：zip 可能自带 buffalo_l/ 顶层文件夹，也可能没有，两种都兼容
+            with zipfile.ZipFile(zip_path) as zf:
+                if any(n.startswith('buffalo_l/') for n in zf.namelist()):
+                    zf.extractall(os.path.join(MODEL_ROOT, 'models'))
+                else:
+                    zf.extractall(model_dir)
+            try:
+                os.remove(zip_path)      # 解压完删掉压缩包，省空间
+            except Exception:
+                pass
+            return True
+        except Exception:
+            return False
+
+    def _gpu_wheel_url(self):
+        """确定 onnxruntime-gpu（CUDA provider 所在）wheel 的下载地址。
+
+        优先用配置的 GPU_RUNTIME_URL；没配置就自动去 PyPI 找和 exe 里捆绑的
+        onnxruntime 同版本的 Windows 安装包，保证 provider 版本完全匹配。
+        """
+        if GPU_RUNTIME_URL:
+            return GPU_RUNTIME_URL
+        ver = onnxruntime.__version__
+        py_tag = 'cp%d%d' % sys.version_info[:2]          # 例如 cp310
+        api = 'https://pypi.org/pypi/onnxruntime-gpu/%s/json' % ver
+        with urllib.request.urlopen(api, timeout=30) as resp:
+            data = json.load(resp)
+        for f in data['urls']:
+            fn = f['filename']
+            if fn.endswith('win_amd64.whl') and ('-%s-' % py_tag) in fn:
+                return f['url']
+        raise RuntimeError("未找到 onnxruntime-gpu %s 的 Windows 安装包" % ver)
+
+    def _pypi_wheel_url(self, pkg, major=None):
+        """找某个 PyPI 包在 Windows 上的 wheel 下载地址。major 指定主版本号（如 cudnn 只要 9.x）。"""
+        api = 'https://pypi.org/pypi/%s/json' % pkg
+        with urllib.request.urlopen(api, timeout=30) as resp:
+            data = json.load(resp)
+
+        def ver_key(v):                      # 把 "9.10.2.21" 拆成数字元组比大小，避免 9.9>9.10 这种错
+            return [int(x) for x in re.split(r'[.\-+]', v) if x.isdigit()] or [0]
+
+        for v in sorted(data['releases'].keys(), key=ver_key, reverse=True):
+            if major is not None and not v.split('.')[0] == str(major):
+                continue
+            for f in data['releases'][v]:
+                if f['filename'].endswith('win_amd64.whl'):
+                    return f['url']
+        raise RuntimeError('找不到 %s 的 Windows 安装包' % pkg)
+
+    @staticmethod
+    def _extract_dlls(wheel_path, dest, need):
+        """从 wheel(实为 zip) 里挑出名字以 need 开头的 DLL，解压到 dest 目录。"""
+        with zipfile.ZipFile(wheel_path) as zf:
+            for name in zf.namelist():
+                base = os.path.basename(name)
+                if base.lower().endswith('.dll') and base.lower().startswith(need):
+                    with zf.open(name) as src, open(os.path.join(dest, base), 'wb') as dst:
+                        shutil.copyfileobj(src, dst)
+
+    def _try_enable_gpu_on_demand(self):
+        """勾选了 GPU 但本机缺 CUDA 运行库时：联网下载 GPU 组件并启用。
+
+        从 PyPI 下载 5 个官方包（onnxruntime-gpu + NVIDIA 的 cublas/cudnn/cudart/
+        cufft 运行库，合计约 1.2GB，只下一次），抽出 DLL 放进 onnxruntime 的 capi
+        目录——onnxruntime 就是从那里找 CUDA provider 的。
+        返回 True=启用成功 / False=失败（没网络、下载失败、目录不可写等），
+        失败时调用方自动退回 CPU，绝不崩。
+        """
+        try:
+            self.msg_queue.put(('status', "正在联网下载 GPU 加速组件（约 1.2GB，只下一次）..."))
+            # onnxruntime 只从自己的 capi 目录加载 CUDA provider，DLL 必须放进去
+            capi = os.path.join(os.path.dirname(onnxruntime.__file__), 'capi')
+            if not os.path.isdir(capi) or not os.access(capi, os.W_OK):
+                return False                       # 包目录不可写，放弃 GPU 走 CPU
+            tmp = os.path.join(capi, '_gpu_tmp')
+            os.makedirs(tmp, exist_ok=True)
+
+            if GPU_RUNTIME_URL:
+                # 用户自托管：一个 zip 里装好全部 DLL，解开挪进 capi 即可
+                zip_path = os.path.join(tmp, 'gpu_runtime.zip')
+                self._stream_download(GPU_RUNTIME_URL, zip_path, "正在下载 GPU 加速组件")
+                self._extract_dlls(zip_path, tmp, ('cublas', 'cudnn', 'cudart', 'cufft',
+                                                   'onnxruntime_providers_cuda',
+                                                   'onnxruntime_providers_shared'))
+            else:
+                # 官方源：onnxruntime-gpu（CUDA provider）+ NVIDIA 运行库
+                wheel = os.path.join(tmp, 'ort_gpu.whl')
+                self._stream_download(self._gpu_wheel_url(), wheel, "正在下载 GPU 加速组件")
+                self._extract_dlls(wheel, tmp, ('onnxruntime_providers_cuda',
+                                                'onnxruntime_providers_shared'))
+                os.remove(wheel)
+                for pkg, major in (('nvidia-cublas-cu12', 12), ('nvidia-cuda-runtime-cu12', 12),
+                                   ('nvidia-cudnn-cu12', 9), ('nvidia-cufft-cu12', None)):
+                    w = os.path.join(tmp, pkg + '.whl')
+                    self._stream_download(self._pypi_wheel_url(pkg, major), w,
+                                          "正在下载 GPU 加速组件")
+                    self._extract_dlls(w, tmp, ('cublas', 'cudnn', 'cudart', 'cufft'))
+                    os.remove(w)
+
+            # 全部 DLL 挪进 onnxruntime 的 capi 目录
+            for f in os.listdir(tmp):
+                if f.lower().endswith('.dll'):
+                    shutil.move(os.path.join(tmp, f), os.path.join(capi, f))
+            shutil.rmtree(tmp, ignore_errors=True)
+
+            self._gpu_runtime = _gpu_runtime_ready()
+            self._cuda_available = self._nvidia_driver and self._gpu_runtime
+            return self._cuda_available
+        except Exception:
+            return False
 
     # ---------------- 后台聚类 ----------------
     def _cluster_worker(self, d, eps, min_cluster):
@@ -918,14 +1163,41 @@ class FaceAlbumGUI:
 
             # 懒加载模型：只在第一次聚类时初始化并复用。self.app 之前是 None
             if self.app is None:
-                # 三元表达式 = C++ 的 条件?A:B。GPU勾选就["CUDA","CPU"]，否则只["CPU"]
-                providers = (['CUDAExecutionProvider', 'CPUExecutionProvider']
-                             if self.use_gpu.get() else ['CPUExecutionProvider'])
+                # 1) 先确保模型就位：不在本地就联网下载（首次使用）。失败=没网/下载失败
+                if not self._ensure_model_ready():
+                    self.msg_queue.put(('error',
+                        "人脸识别模型没有就绪。首次使用需要联网下载模型（约 300MB），\n"
+                        "当前可能没有网络或下载失败，请检查网络后重新开始聚类。"))
+                    return
+                # 2) 决定是否用 GPU：勾了 GPU 且本机有 CUDA 就直接用；
+                #    勾了但本机没装 CUDA，就尝试“联网下载 GPU 加速组件”；
+                #    都搞不定就退回 CPU（绝不因显卡问题让程序崩掉）。
+                want_gpu = False
+                if self.use_gpu.get():
+                    if self._cuda_available:
+                        want_gpu = True
+                    elif self._try_enable_gpu_on_demand():
+                        want_gpu = True
+                    else:
+                        self.msg_queue.put(('status',
+                                            "未启用 GPU：本机无 NVIDIA 显卡或无法联网下载加速组件，已使用 CPU"))
+                providers = (['CUDAExecutionProvider', 'CPUExecutionProvider'] if want_gpu
+                             else ['CPUExecutionProvider'])
+                self.msg_queue.put(('status',
+                                    "正在加载人脸模型（" + ("GPU 加速" if want_gpu else "CPU")
+                                    + "）..."))
                 # FaceAnalysis(name='buffalo_l',...) 参数名=值 是“关键字参数”，不用记顺序。
                 # providers 是“执行后端”列表：能上 GPU(CUDA)就 GPU，不行退回 CPU。
-                self.app = FaceAnalysis(name='buffalo_l', root=MODEL_ROOT, providers=providers)
-                self.app.prepare(ctx_id=0 if self.use_gpu.get() else -1, det_size=(640, 640))
-                # ctx_id=0 用GPU / -1 用CPU。det_size 检测分辨率，越大越准越慢
+                try:
+                    self.app = FaceAnalysis(name='buffalo_l', root=MODEL_ROOT, providers=providers)
+                    self.app.prepare(ctx_id=0 if want_gpu else -1, det_size=(640, 640))
+                    # ctx_id=0 用GPU / -1 用CPU。det_size 检测分辨率，越大越准越慢
+                except Exception:
+                    # ★ 兜底：就算探测说“有”，实际加载失败（驱动不对/缺运行时）也退回 CPU
+                    self.app = FaceAnalysis(name='buffalo_l', root=MODEL_ROOT,
+                                            providers=['CPUExecutionProvider'])
+                    self.app.prepare(ctx_id=-1, det_size=(640, 640))
+                    self.msg_queue.put(('status', "显卡不可用，已自动改用 CPU 运行"))
 
             # ------------------------------------------------------------------
             # 第二阶段：逐张图片做人脸检测 + 特征提取
@@ -934,6 +1206,7 @@ class FaceAlbumGUI:
             qualities = []    # 与 embeddings 一一对应：每张脸的“清楚分”（0~1），模糊=低分
             metas = []        # 与 embeddings 一一对应：记录这张脸来自哪张图、人脸框在哪
             total = len(images)
+            use_half = False  # 中等/巨大量级时，特征改存 float16（内存减半，存半精度算全精度）
             for i, p in enumerate(images):
                 # enumerate(list)：遍历时同时给你 (下标, 元素)。类似 C++ for i 但更顺手。
                 # p 是当前图片的完整路径
@@ -942,8 +1215,15 @@ class FaceAlbumGUI:
                     continue    # 损坏或无法读取的图片直接跳过（continue=跳过本次循环）
                 faces = self.app.get(img)   # ★ 人脸检测！返回这张图里所有检测到的人脸
                 # insightface 模型会自动做检测+对齐+提取特征，faces 是个 list
+                if not use_half and len(embeddings) + len(faces) > FACE_TIER_MID:
+                    # ★ 量级升级：人脸总数已跨过“中等”档，把已收的特征一次性转成
+                    #   float16（半精度），之后的也都按半精度存——内存省一半，
+                    #   聚类时再转回 float32 算，精度几乎无损。
+                    use_half = True
+                    embeddings = [e.astype(np.float16) for e in embeddings]
                 for face in faces:          # 一张合照可能有多张脸，逐一处理
-                    embeddings.append(face.embedding.astype(np.float32))
+                    embeddings.append(face.embedding.astype(np.float16 if use_half
+                                                            else np.float32))
                     # face.embedding 是人脸特征向量(默认numpy float32)。astype 转成float32。
                     # .append 往列表尾部加元素(≈ vector::push_back)
                     metas.append({'image': p, 'bbox': face.bbox.tolist()})
@@ -962,11 +1242,26 @@ class FaceAlbumGUI:
                 self.msg_queue.put(('error', "所有图片中都没有检测到人脸"))
                 return
 
+            # ★ 巨大量级“确认闸门”：人脸数太多，先问用户同不同意，同意才继续。
+            #   这里在后台线程，不能直接弹窗，所以发消息给主线程弹窗，
+            #   再用事件(Event)等主线程把用户回答传回来。
+            if len(embeddings) > FACE_TIER_HUGE:
+                est_mb = len(embeddings) * 2 // (1024 * 1024)   # 每张脸≈2KB 的估算
+                self._confirm_event.clear()
+                self._confirm_ok = False
+                self.msg_queue.put(('confirm', (len(embeddings), est_mb)))
+                self._confirm_event.wait()          # 阻塞等待主线程回话
+                if not self._confirm_ok:
+                    self.msg_queue.put(('cancelled', "人脸数量过多，已取消本轮聚类"))
+                    return
+
             # ------------------------------------------------------------------
             # 第三阶段：归一化 + 智能聚类（先粗分，再认老大、认亲合并）
             # ------------------------------------------------------------------
             # 把“列表 of 向量”变成一个二维 numpy 矩阵，形状 (人脸数, 512)
             emb = np.array(embeddings)
+            if emb.dtype == np.float16:
+                emb = emb.astype(np.float32)   # 存半精度、算全精度：精度几乎无损
             # L2 归一化：每个向量除以自己的长度，长度变为1。
             # 好处：两个都归一化后，点积就代表余弦相似度，判断“像不像”很简单。
             # np.linalg.norm(emb, axis=1) 对每行求长度；keepdims=True 保住维度好做除法；
@@ -1033,6 +1328,17 @@ class FaceAlbumGUI:
                     self.progress['maximum'] = total   # 设置进度条最大值
                     self.progress['value'] = cur       # 设置当前进度
                     self.status_text.set(text)         # 顺便更新文字（如“已处理3/10”）
+                elif kind == 'confirm':          # 巨大量级：弹窗问用户要不要继续
+                    n, est_mb = msg[1]
+                    # 主线程弹确认框，把用户的回答写回 _confirm_ok 并唤醒后台线程
+                    self._confirm_ok = messagebox.askyesno(
+                        "大量人脸确认",
+                        f"检测到约 {n} 张人脸，继续聚类预计占用内存约 {est_mb} MB、"
+                        f"耗时也会明显变长。\n\n确定继续吗？")
+                    self._confirm_event.set()
+                elif kind == 'cancelled':        # 用户拒绝继续，优雅地结束本轮
+                    self.status_text.set(msg[1])
+                    self._cluster_finished()
                 elif kind == 'error':
                     self.status_text.set("出错")
                     self._cluster_finished()   # 出错也代表本轮结束，恢复可再跑
@@ -1073,6 +1379,11 @@ class FaceAlbumGUI:
         # highlightbackground 是 tk.Frame/Label 的“边框颜色”，改成主色调=出现高亮描边
         widget.bind("<Leave>", lambda e: widget.config(highlightbackground=C_BORDER))
         # 鼠标一走，边框颜色恢复成默认的淡色
+
+    def _hide_empty(self):
+        """收起画布中央的“还没有聚类结果”占位提示（有内容了就不需要它）。"""
+        if self._empty is not None:
+            self._empty.place_forget()
 
     # ---------------- 命名人物 ----------------
     def _rename_group(self, group):
@@ -1170,28 +1481,29 @@ class FaceAlbumGUI:
         # 让 4 列等宽、平均拉伸，把整行铺满（否则卡片会缩在左边）
         for c in range(cols):
             self.grid_frame.columnconfigure(c, weight=1, uniform='card_col')
+        self._hide_empty()        # 有结果了，收起空状态占位提示
         for i, group in enumerate(self.groups):   # 遍历每一组人物
             r, c = divmod(i, cols)                # divmod(a,b) 一次给(a//b, a%b)，即(行,列)
-            # ★美化：白底卡片，圆角感(靠四周内边距)+淡边框，悬停边框变主色
+            # 白底卡片：细边框 + 悬停变主色，干净不花哨
             card = tk.Frame(self.grid_frame, bg='white', padx=8, pady=8,
-                            highlightbackground=C_BORDER, highlightthickness=2)
+                            highlightbackground=C_BORDER, highlightthickness=1)
             card.grid(row=r, column=c, padx=12, pady=12, sticky='nsew')   # 放进网格(r,c)
             # sticky='nsew'：让卡片向东南西北四方“伸展”以填满格子
-            self._bind_card_hover(card, C_CARD_HOV)   # ★美化：卡片悬停高亮
+            self._bind_card_hover(card, C_CARD_HOV)   # 卡片悬停高亮
 
             # 卡片内容分三块：上面是“人脸缩略图”，中间是“人物名字”，下面是“照片数”。
             # 用 tk.Frame 把三行信息竖着叠放(pack 默认从上往下)，结构更清楚。
             head = tk.Frame(card, bg='white')
             head.pack(fill=tk.X)
             first = group['items'][0]      # 取这组的第一张脸信息 dict
-            thumb = make_face_thumb(first['image'], first['bbox'], size=(180, 180))
+            thumb = make_face_thumb(first['image'], first['bbox'], size=(176, 176))
             # 用第1张脸做人脸缩略图（前面写的读图+裁剪函数）
             if thumb:                      # 不是None（生成成功）才显示
                 lbl = tk.Label(head, image=thumb, bg='white', cursor='hand2')
                 # Label 直接拿图片当内容；cursor='hand2' 鼠标悬停变“小手”
                 lbl.image = thumb  # type: ignore[attr-defined]   ★ 防 GC 关键！Tk 的图片对象若不被变量引用会被垃圾回收
                 #                                   导致显示空白。把图片挂到控件属性上保命。
-                lbl.pack(pady=(6, 2))      # 显示
+                lbl.pack(pady=(8, 2))      # 显示
                 # bind("<Button-1>", 回调)：绑定“鼠标左键按下”事件。
                 # 回调用了 lambda e, g=group, idx=i: ...：
                 #   ① 必须接收事件参数 e（Tk 回调第一个参数固定是事件对象）
@@ -1200,11 +1512,10 @@ class FaceAlbumGUI:
                 #      group/idx 是循环变量，循环结束后全变成最后一次的值(闭包晚绑定)。
                 #      用默认参数把“当前这一轮的值”提前“拍照固定”下来，每个按钮才对。
                 lbl.bind("<Button-1>", lambda e, g=group, idx=i: self._show_person(g, idx))
-                self._bind_card_hover(lbl, C_CARD_HOV)   # ★美化：图片区也能触发高亮
+                self._bind_card_hover(lbl, C_CARD_HOV)   # 图片区也能触发高亮
                 self._thumb_refs.append(thumb)   # 再存一份引用，双保险
 
-            # 卡片下方的标题文字：未分类组 / 普通人物组
-            # ★美化：分两行显示——标题加粗大一点，“共 M 张”用灰色小字。
+            # 卡片下方的标题文字：人物名字加粗，“共 M 张”灰色小字。
             # 人物名字：用户起过名就用名字，没起名就先叫“人物 N”（未分类固定叫“未分类”）
             if group['type'] == 'unclassified':
                 title = "未分类"
@@ -1219,7 +1530,7 @@ class FaceAlbumGUI:
             # 人物组才有“命名”按钮：点一下弹输入框起个名字，方便导出时当文件夹名。
             # 未分类不允许命名（也不导出），所以不给按钮。
             if group['type'] == 'person':
-                ttk.Button(card, text="✏️ 命名", width=8,
+                ttk.Button(card, text="命名", width=8,
                            command=lambda g=group: self._rename_group(g)).pack(pady=(2, 0))
             # pady=(6,0)：上下留白 (上6, 下0)。很多Tk参数接受(左右/上下)这种元组。
 
@@ -1233,12 +1544,12 @@ class FaceAlbumGUI:
             # 详情窗口标题也带上人物名字（有名字用名字，没名字用“人物N”）
             gname = group.get('name') or f"人物 {idx + 1}"
             win.title(f"{gname} · 共 {len(group['items'])} 张照片")
-        win.geometry("1050x720")       # 子窗口大小
-        win.minsize(700, 500)          # 最小尺寸
+        win.geometry("1140x780")       # 子窗口大小
+        win.minsize(760, 540)          # 最小尺寸
 
+        # 详情窗口顶部一行提示，弱化处理
         ttk.Label(win, text="点击任意照片用系统默认程序打开原图",
-                  font=FONT, foreground='#666', padding=(10, 6)).pack(fill=tk.X)
-        # 顶部提示一行字：#666 中灰。padding=(10,6) 四周留白
+                  font=FONT_SMALL, foreground=C_TEXT_SUB, padding=(12, 8)).pack(fill=tk.X)
 
         # 详情窗口里同样用一个可滚动 Canvas 铺照片网格（与主界面结构完全一致，可对照看）
         container = ttk.Frame(win)
@@ -1268,8 +1579,9 @@ class FaceAlbumGUI:
         for i, item in enumerate(group['items']):   # 遍历这个人物组的每一张照片
             r, c = divmod(i, cols)
             frame = tk.Frame(gf, bg='white', padx=4, pady=4,
-                             highlightbackground=C_BORDER, highlightthickness=2)
+                             highlightbackground=C_BORDER, highlightthickness=1)
             frame.grid(row=r, column=c, padx=8, pady=8, sticky='nsew')
+            self._bind_card_hover(frame, C_CARD_HOV)   # 照片卡悬停同样高亮
 
             thumb = make_face_thumb(item['image'], item['bbox'], size=(200, 200))
             if thumb:
