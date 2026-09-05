@@ -82,7 +82,7 @@ from insightface.app import FaceAnalysis   # 现成的人脸检测 + 512 维特�
 
 # --- Qt (PySide6) 界面库 ---
 # QtCore：核心（坐标、定时器、动画、信号）
-from PySide6.QtCore import (Qt, QRectF, QTimer, QPropertyAnimation,
+from PySide6.QtCore import (Qt, QRectF, QPointF, QTimer, QPropertyAnimation,
                             QVariantAnimation, QEasingCurve, QAbstractAnimation,
                             QRect, Signal)
 # QtGui：画笔/颜色/图片/字体
@@ -459,6 +459,43 @@ def make_face_thumb(image_path, bbox, size=(176, 176)):
         data = canvas.tobytes('raw', 'RGB')        # Pillow 字节 → QImage → QPixmap
         qimg = QImage(data, size[0], size[1], size[0] * 3, QImage.Format_RGB888).copy()
         return QPixmap.fromImage(qimg)
+    except Exception:
+        return None                                # 任何异常都返回空，不拖垮主流程
+
+
+def zoom_face_crop(path, bbox, max_dim=900):
+    """把原图里目标人脸那块裁出来、放大留边，存成临时图返回路径。
+
+    系统默认看图软件没法“指定缩放到某个坐标”，所以这里生成一张
+    以人脸为中心、带留边的特写图，交给默认软件打开 = 自动对准人脸。
+    人脸太小(<900px)会自动放大，保证打开后一眼能看清。
+    返回临时文件路径；失败返回 None（调用方退回打开原图）。
+    """
+    try:
+        img = read_image(path)
+        if img is None:
+            return None
+        h, w = img.shape[:2]
+        x1, y1, x2, y2 = [int(v) for v in bbox]    # bbox=(左上x,左上y,右下x,右下y)
+        fw, fh = x2 - x1, y2 - y1
+        pad = int(max(fw, fh) * 0.55)              # 人脸四周再扩 55% 当留边
+        x1 = max(0, x1 - pad); y1 = max(0, y1 - pad)   # 夹到图片内
+        x2 = min(w, x2 + pad); y2 = min(h, y2 + pad)
+        crop = img[y1:y2, x1:x2]                   # 切片 = 裁剪，就这么一行
+        if crop.size == 0:
+            crop = img
+        ch, cw = crop.shape[:2]
+        if 0 < max(cw, ch) < max_dim:              # 特写太小就放大，看人脸更清楚
+            scale = max_dim / max(cw, ch)
+            crop = cv2.resize(crop, None, fx=scale, fy=scale,
+                              interpolation=cv2.INTER_LANCZOS4)
+        ext = '.png' if os.path.splitext(path)[1].lower() in ('.png', '.webp', '.bmp') else '.jpg'
+        base = re.sub(r'[\\/:*?"<>|]', '_', os.path.basename(path))
+        zoom_dir = os.path.join(tempfile.gettempdir(), 'face_album_zoom')
+        os.makedirs(zoom_dir, exist_ok=True)
+        dst = os.path.join(zoom_dir, 'zoom_%s_%d_%d%s' % (base, x1, y1, ext))
+        Image.fromarray(cv2.cvtColor(crop, cv2.COLOR_BGR2RGB)).save(dst)
+        return dst
     except Exception:
         return None                                # 任何异常都返回空，不拖垮主流程
 
@@ -1182,7 +1219,7 @@ class MainWindow(QWidget):
         row2.addStretch(1)                         # 右侧留弹性空隙，防止控件拉太开
         top_lay.addLayout(row2)
 
-        tip = QLabel('提示：点击人物卡片可查看该人物的全部照片；点击照片可用系统默认程序打开原图。')
+        tip = QLabel('提示：点击人物卡片可查看该人物的全部照片；点击照片可在内嵌看图器中查看（自动放大到人脸）。')
         tip.setStyleSheet('color:rgba(245,247,250,120);font-size:12px;background:transparent;')
         top_lay.addWidget(tip)
 
@@ -2064,7 +2101,7 @@ class HelpDialog(_FadeCloseMixin, QDialog):
         op = QLabel(
             '■  操 作 介 绍\n'
             '1. 点击「浏览」选择照片文件夹\n'
-            '2. 按需调整 eps 阈值 / 最少张数 / GPU 加速\n'
+            '2. 按需调整 eps 阈值（若不同人被归为同一类则调小eps，反之则调大） / 最少张数 / GPU 加速\n'
             '3. 点击「开始聚类」等待识别完成\n'
             '4. 完成后点击人物卡片查看全部照片\n'
             '5. 点卡片上的「命名」给人物起名字\n'
@@ -2136,12 +2173,278 @@ class HelpDialog(_FadeCloseMixin, QDialog):
 
 
 # ---------------------------------------------------------------------------
+# ImageView —— 内嵌看图器的“画布”
+#   自绘整张原图，支持：滚轮以光标为锚点缩放、拖拽平移、
+#   以及“从适应窗口丝滑飞到目标人脸”的开场动画。
+# ===========================================================================
+class ImageView(QWidget):
+    MIN_SCALE = 0.02
+    MAX_SCALE = 40.0
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._pm = None            # 原图 QPixmap
+        self._scale = 1.0          # 当前缩放倍率
+        self._ox = 0.0             # 图片左上角在控件里的 x
+        self._oy = 0.0
+        self._anim = None          # 正在播的动画(同时只允许一个)
+        self._drag = False
+        self._press = None
+        self.setMouseTracking(True)
+        self.setCursor(QCursor(Qt.OpenHandCursor))
+        self.setAttribute(Qt.WA_TranslucentBackground)
+        self.setFocusPolicy(Qt.StrongFocus)
+
+    # ---- 加载原图：先适应窗口，再(可选)丝滑飞到人脸 ----
+    def load(self, path, bbox=None):
+        try:
+            img = read_image(path)
+            if img is None:
+                return False
+            self._pm = _cv_to_qpixmap(img)
+        except Exception:
+            return False
+        self._cancel_anim()
+        self._fit_view()
+        self.update()
+        if bbox is not None:
+            self.fly_to_view(*self._face_view(bbox), ms=520)
+        return True
+
+    def _fit_view(self):
+        """算好“整图适应窗口”的视图。"""
+        if self._pm is None or self._pm.isNull():
+            return
+        ws, hs = self.width(), self.height()
+        iw, ih = self._pm.width(), self._pm.height()
+        self._scale = min(ws / iw, hs / ih)
+        self._ox = (ws - iw * self._scale) / 2
+        self._oy = (hs - ih * self._scale) / 2
+
+    def _face_view(self, bbox):
+        """算好“目标人脸居中、四周留 50% 边”的视图，返回 (scale, ox, oy)。"""
+        iw, ih = self._pm.width(), self._pm.height()
+        x1, y1, x2, y2 = [float(v) for v in bbox]
+        fw, fh = x2 - x1, y2 - y1
+        pad = max(fw, fh) * 0.5                 # 人脸四周留边，有点构图感
+        tw, th = fw + 2 * pad, fh + 2 * pad
+        ws, hs = self.width(), self.height()
+        scale = min(ws / tw, hs / th) * 1.15    # 让“人脸+留边”约占满窗口
+        cx, cy = (x1 + x2) / 2, (y1 + y2) / 2
+        ox = ws / 2 - cx * scale
+        oy = hs / 2 - cy * scale
+        return scale, ox, oy
+
+    def fly_to_view(self, s2, ox2, oy2, ms=420):
+        """把视图从当前状态丝滑过渡到目标 (scale, ox, oy)。"""
+        self._cancel_anim()
+        s1, ox1, oy1 = self._scale, self._ox, self._oy
+        self._anim = QVariantAnimation(self)
+        self._anim.setStartValue(0.0)
+        self._anim.setEndValue(1.0)
+        self._anim.setDuration(ms)
+        self._anim.setEasingCurve(QEasingCurve.OutCubic)
+        self._anim.valueChanged.connect(
+            lambda k: self._on_fly(k, s1, ox1, oy1, s2, ox2, oy2))
+        self._anim.finished.connect(lambda: setattr(self, '_anim', None))
+        self._anim.start()
+
+    def _on_fly(self, k, s1, ox1, oy1, s2, ox2, oy2):
+        self._scale = s1 + (s2 - s1) * k
+        self._ox = ox1 + (ox2 - ox1) * k
+        self._oy = oy1 + (oy2 - oy1) * k
+        self.update()
+
+    def _cancel_anim(self):
+        if self._anim is not None:
+            self._anim.stop()
+            self._anim = None
+
+    def zoom_by(self, factor):
+        """以控件中心为锚点缩放（键盘 +/- 用）。"""
+        if self._pm is None or self._pm.isNull():
+            return
+        self._cancel_anim()
+        pos = QPointF(self.width() / 2, self.height() / 2)
+        imgx = (pos.x() - self._ox) / self._scale
+        imgy = (pos.y() - self._oy) / self._scale
+        self._scale = max(self.MIN_SCALE, min(self.MAX_SCALE, self._scale * factor))
+        self._ox = pos.x() - imgx * self._scale
+        self._oy = pos.y() - imgy * self._scale
+        self.update()
+
+    # ---- 滚轮缩放(以光标为锚点：光标下的图像点保持不动) ----
+    def wheelEvent(self, e):
+        if self._pm is None or self._pm.isNull():
+            return
+        self._cancel_anim()
+        delta = e.angleDelta().y()
+        if not delta:
+            return
+        factor = 1.2 ** (delta / 120.0)
+        pos = e.position()
+        imgx = (pos.x() - self._ox) / self._scale
+        imgy = (pos.y() - self._oy) / self._scale
+        self._scale = max(self.MIN_SCALE, min(self.MAX_SCALE, self._scale * factor))
+        self._ox = pos.x() - imgx * self._scale
+        self._oy = pos.y() - imgy * self._scale
+        self.update()
+
+    # ---- 拖拽平移 ----
+    def mousePressEvent(self, e):
+        if e.button() == Qt.LeftButton and self._pm is not None and not self._pm.isNull():
+            self._drag = True
+            self._press = e.position()
+            self.setCursor(QCursor(Qt.ClosedHandCursor))
+        super().mousePressEvent(e)
+
+    def mouseMoveEvent(self, e):
+        if self._drag and self._press is not None:
+            self._cancel_anim()
+            self._ox += e.position().x() - self._press.x()
+            self._oy += e.position().y() - self._press.y()
+            self._press = e.position()
+            self.update()
+        super().mouseMoveEvent(e)
+
+    def mouseReleaseEvent(self, e):
+        if e.button() == Qt.LeftButton:
+            self._drag = False
+            self.setCursor(QCursor(Qt.OpenHandCursor))
+        super().mouseReleaseEvent(e)
+
+    def paintEvent(self, e):
+        p = QPainter(self)
+        p.fillRect(self.rect(), QColor(16, 18, 24))      # 深色底，像真正的看图器
+        if self._pm and not self._pm.isNull():
+            p.setRenderHint(QPainter.SmoothPixmapTransform)
+            iw, ih = self._pm.width(), self._pm.height()
+            dst = QRectF(self._ox, self._oy, iw * self._scale, ih * self._scale)
+            p.drawPixmap(dst, self._pm, QRectF(0, 0, iw, ih))
+
+
+# ---------------------------------------------------------------------------
+# ImageViewer —— 内嵌看图器窗口
+#   点击详情窗口里的照片打开：整张原图自绘显示，开场丝滑飞向人脸；
+#   之后滚轮缩放、拖动平移、←/→ 切换同一人物的其他照片。
+# ===========================================================================
+class ImageViewer(_FadeCloseMixin, QDialog):
+    def __init__(self, parent, items, index):
+        super().__init__(parent)
+        self.setWindowFlags(Qt.Dialog | Qt.FramelessWindowHint)
+        self.setAttribute(Qt.WA_TranslucentBackground)
+        self.setModal(False)
+        self._items = items
+        self._index = index
+        self.resize(1120, 760)
+        self.setMinimumSize(720, 520)
+
+        outer = QVBoxLayout(self)
+        outer.setContentsMargins(18, 18, 18, 18)
+        panel = GlassPanel(tint=QColor(36, 42, 54, 235), radius=14)
+        outer.addWidget(panel)
+        lay = QVBoxLayout(panel)
+        lay.setContentsMargins(16, 12, 16, 16)
+        lay.setSpacing(10)
+
+        # ---- 顶栏：文件名 + 操作按钮 ----
+        head = QHBoxLayout()
+        self.lbl_name = QLabel('')
+        self.lbl_name.setStyleSheet('color:white;font-size:15px;font-weight:600;'
+                                    'background:transparent;')
+        head.addWidget(self.lbl_name)
+        head.addStretch(1)
+        b_fit = GlassButton('适应窗口')
+        b_fit.setMinimumWidth(90)
+        b_fit.clicked.connect(self._fit)
+        b_prev = GlassButton('◀')
+        b_prev.setFixedWidth(46)
+        b_prev.clicked.connect(lambda: self._step(-1))
+        b_next = GlassButton('▶')
+        b_next.setFixedWidth(46)
+        b_next.clicked.connect(lambda: self._step(1))
+        b_open = GlassButton('系统软件打开')
+        b_open.setMinimumWidth(116)
+        b_open.clicked.connect(self._open_external)
+        x = QPushButton('✕')
+        x.setFixedSize(30, 30)
+        x.setCursor(QCursor(Qt.PointingHandCursor))
+        x.setStyleSheet('QPushButton{background:rgba(255,255,255,18);color:white;'
+                        'border:none;border-radius:15px;}'
+                        'QPushButton:hover{background:rgba(255,255,255,40);}')
+        x.clicked.connect(self.accept)
+        for b in (b_fit, b_prev, b_next, b_open, x):
+            head.addWidget(b)
+        lay.addLayout(head)
+
+        self.view = ImageView()
+        lay.addWidget(self.view, 1)
+
+        tip = QLabel('滚轮缩放 · 拖拽平移 · ←/→ 切换照片 · Esc 关闭')
+        tip.setStyleSheet('color:rgba(245,247,250,130);font-size:12px;'
+                          'background:transparent;')
+        tip.setAlignment(Qt.AlignCenter)
+        lay.addWidget(tip)
+
+        # 等窗口真正显示、布局定完尺寸后再加载第一张并播放飞向人脸动画
+        QTimer.singleShot(0, self._load_current)
+
+    def _load_current(self):
+        item = self._items[self._index]
+        self.lbl_name.setText('%d/%d · %s' % (self._index + 1, len(self._items),
+                                              os.path.basename(item['image'])))
+        self.view.load(item['image'], item.get('bbox'))
+
+    def _step(self, d):
+        n = len(self._items)
+        if n == 0:
+            return
+        self._index = (self._index + d) % n
+        self._load_current()
+
+    def _fit(self):
+        if self.view._pm is None or self.view._pm.isNull():
+            return
+        iw, ih = self.view._pm.width(), self.view._pm.height()
+        ws, hs = self.view.width(), self.view.height()
+        s = min(ws / iw, hs / ih)
+        self.view.fly_to_view(s, (ws - iw * s) / 2, (hs - ih * s) / 2, ms=320)
+
+    def _open_external(self):
+        item = self._items[self._index]
+        try:
+            target = (zoom_face_crop(item['image'], item['bbox'])
+                      if item.get('bbox') else None)
+            os.startfile(target if target else item['image'])
+        except Exception:
+            show_glass_info(None, '照片路径', item['image'])
+
+    def keyPressEvent(self, e):
+        if e.key() == Qt.Key_Left:
+            self._step(-1)
+        elif e.key() == Qt.Key_Right:
+            self._step(1)
+        elif e.key() == Qt.Key_Escape:
+            self.reject()
+        elif e.key() in (Qt.Key_Plus, Qt.Key_Equal):
+            self.view.zoom_by(1.25)
+        elif e.key() == Qt.Key_Minus:
+            self.view.zoom_by(0.8)
+        else:
+            super().keyPressEvent(e)
+
+    def showEvent(self, e):
+        super().showEvent(e)
+        _fade_in_window(self)
+
+
+# ---------------------------------------------------------------------------
 # PersonDialog —— 人物详情窗口
 #   点主界面的卡片后打开：毛玻璃面板里放这一组所有照片的头像网格，
-#   点某个头像 → 用系统默认程序打开原图。
+#   点某个头像 → 打开内嵌看图器(开场自动飞到人脸)。
 # ===========================================================================
 class PersonDialog(_FadeCloseMixin, QDialog):
-    """毛玻璃详情窗口：网格展示某个人物的所有照片，点击打开原图。"""
+    """毛玻璃详情窗口：网格展示某个人物的所有照片，点击打开内嵌看图器。"""
 
     def __init__(self, parent, group, idx):
         super().__init__(parent)
@@ -2174,7 +2477,7 @@ class PersonDialog(_FadeCloseMixin, QDialog):
         t.setStyleSheet('color:white;font-size:18px;font-weight:700;background:transparent;')
         head.addWidget(t)
         head.addStretch(1)
-        tip = QLabel('点击任意照片用系统默认程序打开原图')
+        tip = QLabel('点击任意照片：内嵌看图器打开并自动放大到人脸')
         tip.setStyleSheet('color:rgba(245,247,250,130);font-size:12px;background:transparent;')
         head.addWidget(tip)
         x = QPushButton('✕')
@@ -2232,18 +2535,16 @@ class PersonDialog(_FadeCloseMixin, QDialog):
             cv.addWidget(nl)
             r, c = divmod(i, cols)
             grid.addWidget(cell, r, c)
-            av.clicked.connect(lambda p=item['image']: self._open_full(p))
+            av.clicked.connect(lambda i=i: self._open_viewer(i))
 
     def showEvent(self, e):
         super().showEvent(e)
         _fade_in_window(self)
 
-    @staticmethod
-    def _open_full(path):
-        try:
-            os.startfile(path)
-        except Exception:
-            show_glass_info(None, '照片路径', path)
+    def _open_viewer(self, i):
+        """点某张照片 → 打开内嵌看图器(开场自动飞到人脸)。"""
+        dlg = ImageViewer(self, self._group['items'], i)
+        dlg.exec()
 
 
 # ============================================================================
