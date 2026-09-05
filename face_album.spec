@@ -2,7 +2,7 @@
 
 
 a = Analysis(
-    ['face_album_gui.py'],
+    ['face_album_qt.py'],
     pathex=[],
     binaries=[],
     datas=[],
@@ -10,7 +10,15 @@ a = Analysis(
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],
-    excludes=[],
+    excludes=['PySide6.QtWebEngineCore', 'PySide6.QtWebEngineWidgets',
+              'PySide6.Qt3DCore', 'PySide6.QtMultimedia', 'PySide6.QtQml',
+              'PySide6.QtQuick', 'PySide6.QtQuickWidgets', 'PySide6.QtCharts',
+              'PySide6.QtDataVisualization', 'PySide6.QtBluetooth',
+              'PySide6.QtNfc', 'PySide6.QtPositioning', 'PySide6.QtSensors',
+              'PySide6.QtSerialPort', 'PySide6.QtSql', 'PySide6.QtTest',
+              'PySide6.QtWebChannel', 'PySide6.QtWebSockets', 'PySide6.QtPdf',
+              'PySide6.QtHelp', 'PySide6.QtDesigner', 'PySide6.QtUiTools',
+              'PySide6.QtRemoteObjects', 'tkinter'],
     noarchive=False,
     optimize=0,
 )

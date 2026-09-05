@@ -9,4 +9,4 @@ if %errorlevel%==0 (
     call conda activate face-album 2>nul
 )
 
-start "" pythonw "%ROOT%face_album_gui.py"
+start "" pythonw "%ROOT%face_album_qt.py"
