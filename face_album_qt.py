@@ -119,6 +119,14 @@ MODEL_ROOT = next((r for r in _CANDIDATE_ROOTS
 # ---------------------------------------------------------------------------
 SUPPORTED = {'.jpg', '.jpeg', '.png', '.bmp', '.webp'}   # 只认这几种扩展名
 MODEL_DL_URL = 'https://github.com/deepinsight/insightface/releases/download/v0.7/buffalo_l.zip'
+
+# 打包成 exe 后，内置资源(背景图)会被释放到临时目录 sys._MEIPASS 里；
+# 平时跑源码时就从脚本同目录找。
+def _resource_path(name):
+    base = getattr(sys, '_MEIPASS', None)
+    if base:
+        return os.path.join(base, name)
+    return os.path.join(os.path.dirname(os.path.abspath(__file__)), name)
 GPU_RUNTIME_URL = ''            # 留空 = 从 PyPI 自动下载 GPU 组件
 GPU_RUNTIME_DLLS = ('onnxruntime_providers_cuda.dll', 'cublas64_12.dll',
                     'cublasLt64_12.dll', 'cudart64_12.dll', 'cudnn64_9.dll')
@@ -127,7 +135,7 @@ GPU_RUNTIME_DLLS = ('onnxruntime_providers_cuda.dll', 'cublas64_12.dll',
 # ③ 界面配色（想换主题只改这里几行）
 #   QColor(r, g, b, a)：第 4 个数 a 是“透明度”，0=全透明，255=不透明
 # ---------------------------------------------------------------------------
-BG_IMG_PATH = r'E:\vscode_background\star.png'     # VSCode 用的星空背景图
+BG_IMG_PATH = _resource_path('star.png')    # VSCode 用的星空背景图(打包时内置)
 PANEL_TINT = QColor(28, 34, 44, 95)                # 面板底色：深蓝灰、95 半透明
 PANEL_BORDER = QColor(186, 200, 216, 70)           # 面板的细边框（浅蓝灰）
 CARD_TINT = QColor(255, 255, 255, 26)              # 人物卡片底色：更透的“白玻璃”
